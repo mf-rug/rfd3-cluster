@@ -63,7 +63,20 @@ where redesigning everything *is* correct.
 Note for anyone extending this: MPNN's `fixed_residues` and `designed_residues`
 are **mutually exclusive** — it raises on both. Format is `["A801","A802",…]`.
 
-### 2.3 Design length was guessed at 300 — `d0fa6d9`
+### 2.3 Range syntax was not expanded on the `--mpnn-designed` path
+
+Introduced by 2.2 and caught by the first `--mpnn-only` run. The derived map
+expanded `A799-804` into individual IDs; the explicit flag split on commas and
+passed the range straight through. MPNN's `_parse_id` accepts only
+`<chain>`, `<chain><num>` or `<chain><num><icode>` and raises:
+
+    ValueError: ID 'A799-804' must look like ...
+
+Two code paths to the same destination, one tested. Both now go through
+`spec.expand_residue_selection`. If you add a third entry point for design
+scope, route it through the same function.
+
+### 2.4 Design length was guessed at 300 — `d0fa6d9`
 
 `max_design_length()` only understood an explicit `length` field and assumed 300
 otherwise. Every partial-diffusion spec falls in that gap, since length is
@@ -138,7 +151,27 @@ Either push the `hpcjob` change or drop the flag from the printed line and the
 docs. It works without it: the registry entry's `jobs_dir` already routes RFD3
 jobs correctly, which is how the successful runs were submitted.
 
-### 3.5 Smaller things
+### 3.5 MPNN bias / omit is not exposed, and scoping alone is not enough
+
+With the scope fix in place, LigandMPNN was run over 32 backbones from three
+independent scaffolds, restricted to the 16 pocket positions, with the NAD
+ligand present (no 2'-phosphate). Across **256 sequences**:
+
+- the 2'-phosphate-gripping arginine came back in **256/256** — 100 %;
+- an acidic residue at the anchor position appeared **0 times**;
+- the second basic position stayed basic (Arg or Lys) in ~97 %.
+
+RFD3 had removed that arginine in most backbones (Leu/Ile modal). MPNN puts it
+back. For a cofactor-specificity switch the sequence stage must be *constrained*,
+not merely scoped — `bias_per_residue` / `omit_per_residue` exist in MPNN's
+per-input config but are not exposed by this generator, so the constrain-and-
+redesign step currently has to be run by hand or off-cluster.
+
+This is the highest-value missing feature for redesign work, as opposed to the
+de-novo case: without it the cluster pipeline cannot produce a switched
+sequence at all.
+
+### 3.6 Smaller things
 
 - **`hpcjob pull` writes to `./<name>/`**, not into the job directory the results
   belong to. `--dest` exists. Since `rfd3-setup-job` already prints a submit
@@ -179,9 +212,10 @@ Everything here was exercised on real jobs and behaved as documented:
 
 ## 5. Suggested order of work
 
-1. §3.4 — the `--jobs-dir` mismatch, since it makes the documented command fail
+1. §3.5 — MPNN bias/omit, without which the pipeline cannot do redesign work.
+2. §3.4 — the `--jobs-dir` mismatch, since it makes the documented command fail
    for anyone starting from the README. Cheapest, most visible.
-2. §3.3 — the QC chainbreak metric, since it actively misleads.
-3. §3.1 — raise the A100 cap after a bisect; the queue cost is real.
-4. §3.2 — walltime model for partial diffusion.
-5. §3.5 — the ergonomics.
+3. §3.3 — the QC chainbreak metric, since it actively misleads.
+4. §3.1 — raise the A100 cap after a bisect; the queue cost is real.
+5. §3.2 — walltime model for partial diffusion.
+6. §3.6 — the ergonomics.

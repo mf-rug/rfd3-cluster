@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .spec import expand_residue_selection
+
 # RFD3 writes **gzipped mmCIF** (`.cif.gz`), never PDB. Plain .cif/.pdb are
 # accepted too so this helper also works on hand-staged inputs.
 STRUCTURE_SUFFIXES = (".pdb", ".cif", ".cif.gz")
@@ -238,14 +240,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.checkpoint, args.checkpoint_glob, args.checkpoint_dir
     )
 
+    # Ranges must be expanded to individual IDs: MPNN's _parse_id accepts only
+    # '<chain>', '<chain><num>' or '<chain><num><icode>' and raises on
+    # 'A799-804'. Both the flag and the map go through the same expander so the
+    # two cannot diverge -- passing a range through cost a queued job once.
     designed: Optional[List[str]] = None
     if args.designed_residues:
-        designed = [t for t in args.designed_residues.replace(",", " ").split() if t]
+        designed = expand_residue_selection(args.designed_residues)
     designed_map: Dict[str, List[str]] = {}
     if args.designed_residues_map:
         map_path = Path(args.designed_residues_map)
         if map_path.is_file():
-            designed_map = json.loads(map_path.read_text())
+            designed_map = {
+                name: expand_residue_selection(" ".join(ids)) if isinstance(ids, list)
+                else expand_residue_selection(ids)
+                for name, ids in json.loads(map_path.read_text()).items()
+            }
         elif not args.quiet:
             print(f"warning: {map_path} not found; MPNN will design every residue",
                   file=sys.stderr)
