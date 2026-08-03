@@ -129,6 +129,19 @@ def resolve_checkpoint(
     )
 
 
+def designed_for(stem: str, designed_map: Dict[str, List[str]]) -> Optional[List[str]]:
+    """Design scope for one backbone, matched by spec name in its filename.
+
+    RFD3 names outputs `<inputs-stem>_<spec>_<batch>_model_<n>`, so the spec is
+    recoverable from the filename. Longest match wins, so a spec named `v6a`
+    cannot capture backbones belonging to `v6a_hotspots`.
+    """
+    for spec_name in sorted(designed_map, key=len, reverse=True):
+        if spec_name in stem:
+            return designed_map[spec_name]
+    return None
+
+
 def build_config(
     *,
     structures: List[Path],
@@ -140,17 +153,28 @@ def build_config(
     temperature: Optional[float] = None,
     write_structures: bool = True,
     write_fasta: bool = True,
+    designed_residues: Optional[List[str]] = None,
+    designed_map: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     inputs: List[Dict[str, Any]] = []
     for path in structures:
+        stem = _stem(path)
         entry: Dict[str, Any] = {
             "structure_path": str(path.resolve()),
-            "name": _stem(path),
+            "name": stem,
             "batch_size": batch_size,
             "number_of_batches": number_of_batches,
         }
         if temperature is not None:
             entry["temperature"] = temperature
+        # Design scope. Without it MPNN redesigns every residue, which is
+        # almost never what a pocket redesign wants -- see
+        # spec.designed_residues_by_spec. An explicit list wins over the
+        # per-spec map; `fixed_residues` is deliberately not set alongside,
+        # since MPNN rejects both at once.
+        scope = designed_residues or designed_for(stem, designed_map or {})
+        if scope:
+            entry["designed_residues"] = list(scope)
         inputs.append(entry)
 
     return {
@@ -190,6 +214,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--gunzip-to", default=None, metavar="DIR",
                     help="Stage decompressed .cif copies of any .cif.gz here "
                          "and point MPNN at those (RFD3 output is gzipped).")
+    ap.add_argument("--designed-residues", default=None, metavar="IDS",
+                    help="Design only these positions in every backbone, e.g. "
+                         "'A799-804,A826-830'. Everything else is held fixed. "
+                         "Without a scope MPNN redesigns the whole protein.")
+    ap.add_argument("--designed-residues-map", default=None, metavar="JSON",
+                    help="File mapping spec name -> list of residue IDs, applied "
+                         "per backbone by matching the spec name in its filename. "
+                         "Written by rfd3-setup-job from select_unfixed_sequence.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -205,6 +237,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     checkpoint = resolve_checkpoint(
         args.checkpoint, args.checkpoint_glob, args.checkpoint_dir
     )
+
+    designed: Optional[List[str]] = None
+    if args.designed_residues:
+        designed = [t for t in args.designed_residues.replace(",", " ").split() if t]
+    designed_map: Dict[str, List[str]] = {}
+    if args.designed_residues_map:
+        map_path = Path(args.designed_residues_map)
+        if map_path.is_file():
+            designed_map = json.loads(map_path.read_text())
+        elif not args.quiet:
+            print(f"warning: {map_path} not found; MPNN will design every residue",
+                  file=sys.stderr)
+
     config = build_config(
         structures=structures,
         model_type=args.model_type,
@@ -214,7 +259,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         number_of_batches=args.number_of_batches,
         temperature=args.temperature,
         write_structures=not args.no_write_structures,
+        designed_residues=designed,
+        designed_map=designed_map,
     )
+
+    scoped = sum(1 for i in config["inputs"] if i.get("designed_residues"))
+    if scoped != len(config["inputs"]) and not args.quiet:
+        print(f"warning: {len(config['inputs']) - scoped} of {len(config['inputs'])} "
+              f"backbone(s) have no design scope -- MPNN will redesign those in full",
+              file=sys.stderr)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,9 +275,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.quiet:
         staged = f", {n_gz} decompressed into {args.gunzip_to}" if (args.gunzip_to and n_gz) else ""
+        scope = (f", {scoped}/{len(config['inputs'])} scoped to "
+                 f"{len(config['inputs'][0].get('designed_residues', []))} designed "
+                 f"position(s)") if scoped else ", NO design scope (whole protein)"
         print(
             f"wrote {out_path} -- {len(structures)} structure(s), "
             f"{args.batch_size * args.number_of_batches} sequence(s) each, "
-            f"checkpoint {checkpoint}{staged}"
+            f"checkpoint {checkpoint}{staged}{scope}"
         )
     return 0

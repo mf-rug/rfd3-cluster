@@ -62,6 +62,11 @@ class MpnnParams:
     checkpoint: Optional[str] = None  # explicit path; else glob-resolved
     temperature: Optional[float] = None
     write_structures: bool = True
+    # Design scope. Without one MPNN redesigns every residue in the backbone.
+    # `designed_map` is the usual route: a JSON of spec name -> residue IDs,
+    # derived from each spec's select_unfixed_sequence so the two cannot drift.
+    designed_residues: Optional[str] = None
+    designed_map: Optional[str] = None
     extra_args: Optional[List[str]] = None
 
 
@@ -262,6 +267,10 @@ def _mpnn_stage(m: MpnnParams, checkpoint_dir: str, venv_bin: str) -> str:
         extra += f"    --temperature {m.temperature} \\\n"
     if not m.write_structures:
         extra += "    --no-write-structures \\\n"
+    if m.designed_residues:
+        extra += f"    --designed-residues '{m.designed_residues}' \\\n"
+    if m.designed_map:
+        extra += f"    --designed-residues-map '{m.designed_map}' \\\n"
     for arg in m.extra_args or []:
         extra += f"    {arg} \\\n"
 

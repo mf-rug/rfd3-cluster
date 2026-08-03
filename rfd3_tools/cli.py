@@ -105,6 +105,16 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--mpnn-batch-size", type=int, default=1)
     m.add_argument("--mpnn-temperature", type=float, default=None)
     m.add_argument("--mpnn-checkpoint", default=None, help="Explicit checkpoint path.")
+    m.add_argument("--mpnn-designed", default=None, metavar="IDS",
+                   help="Positions MPNN may design, e.g. 'A799-804,A826-830'; "
+                        "everything else is held fixed. Default: derived from each "
+                        "spec's select_unfixed_sequence, so MPNN designs exactly "
+                        "what RFD3 was allowed to change.")
+    m.add_argument("--mpnn-design-all", action="store_true",
+                   help="Let MPNN redesign every residue (its own default). Only "
+                        "sensible for de-novo backbones -- on a scaffold redesign "
+                        "it returns sequences tens of percent divergent from the "
+                        "parent, mutating conserved positions outside the pocket.")
     m.add_argument("--no-mpnn-structures", action="store_true",
                    help="Write sequences only, skip designed CIFs.")
 
@@ -288,12 +298,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         mpnn_structures = "./output/rfd3"
         local_structure_dir = None
 
+    # MPNN design scope. Its own default is to redesign every residue, which
+    # silently ruins a scaffold redesign, so derive the scope from what RFD3 was
+    # allowed to change unless the user asks otherwise.
+    designed_map_path = None
+    designed_summary = "whole protein (MPNN default)"
+    if run_mpnn and not args.mpnn_design_all and not args.mpnn_designed:
+        designed_by_spec = spec_mod.designed_residues_by_spec(specs)
+        if designed_by_spec:
+            designed_map_path = "./input/mpnn_designed.json"
+            n = len(next(iter(designed_by_spec.values())))
+            designed_summary = (f"{n} position(s) per spec, from "
+                                f"select_unfixed_sequence")
+    elif args.mpnn_designed:
+        designed_summary = args.mpnn_designed
+
     # ---- write the job dir ------------------------------------------------
     out_dir: Path = args.out_dir
     (out_dir / "input").mkdir(parents=True, exist_ok=True)
 
     if run_rfd3:
         (out_dir / "input" / "designs.json").write_text(json.dumps(specs, indent=2))
+
+    if designed_map_path:
+        (out_dir / "input" / "mpnn_designed.json").write_text(
+            json.dumps(spec_mod.designed_residues_by_spec(specs), indent=2))
 
     if sources or local_structure_dir:
         struct_dir = out_dir / "input" / "structures"
@@ -338,6 +367,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         checkpoint=args.mpnn_checkpoint,
         temperature=args.mpnn_temperature,
         write_structures=not args.no_mpnn_structures,
+        designed_residues=args.mpnn_designed,
+        designed_map=designed_map_path,
     )
 
     slurm = generate.SlurmParams(
@@ -371,6 +402,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"timesteps : {args.timesteps}")
         print(f"length    : {max_length} residues ({length_origin})")
     if run_mpnn:
+        print(f"mpnn scope: {designed_summary}")
         print(f"mpnn      : {args.mpnn_model}, {mpnn_batch * mpnn_nbatches} seq/backbone "
               f"from {mpnn_structures}")
     print(f"resources : {partition_name}, {gpu_sbatch}, {mem}, {cpus} cpus, "

@@ -58,6 +58,18 @@ SPEC_FIELDS = {
 # Fields whose value names a file that must travel to the cluster with the job.
 PATH_FIELDS = ("input",)
 
+# Path recorded in designs.json for a structure shipped with the job.
+#
+# RFD3 resolves a relative `input` against the directory of the *inputs JSON*,
+# not the working directory. That JSON is written to <jobdir>/input/designs.json
+# while the structures land in <jobdir>/input/structures/, so the stored path is
+# relative to input/ -- "./structures/x.pdb", not "./input/structures/x.pdb".
+# Getting this wrong doubles the directory and every design dies in the
+# load_input validator with FileNotFoundError on ".../input/input/structures/..."
+# after the queue wait, before any GPU work. Verified on Snellius, jobs
+# 25171843/25171844.
+STAGED_INPUT_PREFIX = "./structures/"
+
 
 class SpecError(ValueError):
     pass
@@ -270,7 +282,7 @@ def design_length(
 
     `sources` are the pre-rewrite local paths from `rewrite_input_paths`; by
     the time the CLI computes resources, each spec's `input` already points at
-    the not-yet-populated `./input/structures/` copy, so the originals are
+    the not-yet-populated staged copy (`STAGED_INPUT_PREFIX`), so the originals are
     matched back by basename.
     """
     by_name = {Path(source).name: Path(source).expanduser() for source in sources}
@@ -335,9 +347,9 @@ def build_specs(
     """
     base: Dict[str, Any] = {}
     if input_path is not None:
-        # The job runs with the job dir as cwd and the structure shipped into
-        # input/structures/, so store the path it will have *there*.
-        base["input"] = f"./input/structures/{Path(input_path).name}"
+        # Relative to the inputs JSON, which sits beside structures/ -- see
+        # STAGED_INPUT_PREFIX.
+        base["input"] = f"{STAGED_INPUT_PREFIX}{Path(input_path).name}"
     if contig is not None:
         base["contig"] = contig
     if unindex is not None:
@@ -389,6 +401,52 @@ def load_spec_file(path: Path) -> Dict[str, Dict[str, Any]]:
     return data
 
 
+def expand_residue_selection(selection: str) -> List[str]:
+    """`"A799-804,A826-830"` -> `["A799", ..., "A804", "A826", ...]`.
+
+    The output form is what MPNN's `designed_residues` / `fixed_residues` take:
+    a list of `<chain><resnum>` strings (its `_mask_from_ids` also accepts a
+    bare chain, and an insertion code, neither of which RFD3 selections use).
+    """
+    out: List[str] = []
+    for token in re.split(r"[,\s]+", selection.strip()):
+        if not token:
+            continue
+        m = re.fullmatch(r"([A-Za-z]+)(-?\d+)(?:-(-?\d+))?", token)
+        if not m:
+            raise SpecError(f"cannot parse residue selection {token!r}")
+        chain, start, end = m.group(1), int(m.group(2)), m.group(3)
+        stop = int(end) if end is not None else start
+        if stop < start:
+            start, stop = stop, start
+        out.extend(f"{chain}{n}" for n in range(start, stop + 1))
+    return out
+
+
+def designed_residues_by_spec(
+    specs: Dict[str, Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """Positions MPNN should design, per spec, from `select_unfixed_sequence`.
+
+    A pocket redesign frees a handful of positions in RFD3 but MPNN, given no
+    scope, redesigns **every** residue ("Design scope - if all None, design all
+    residues"). On a 440-residue enzyme that returned sequences ~38% divergent
+    from the parent with the conserved pocket aromatic mutated away -- the
+    backbones were fine, the sequences unusable (OVERVIEW 16.6).
+
+    Deriving the scope from the spec rather than a separate flag means the two
+    cannot drift apart: whatever RFD3 was allowed to change is what MPNN
+    designs. Specs without `select_unfixed_sequence` are omitted, and MPNN
+    keeps its default (design everything) for those backbones.
+    """
+    out: Dict[str, List[str]] = {}
+    for name, spec in specs.items():
+        selection = spec.get("select_unfixed_sequence")
+        if isinstance(selection, str) and selection.strip():
+            out[name] = expand_residue_selection(selection)
+    return out
+
+
 def referenced_paths(specs: Dict[str, Dict[str, Any]]) -> List[str]:
     """Local files a spec refers to, which must be shipped with the job."""
     out: List[str] = []
@@ -413,8 +471,8 @@ def rewrite_input_paths(
         value = spec.get("input")
         if not isinstance(value, str) or not value:
             continue
-        if value.startswith("./input/structures/"):
+        if value.startswith(STAGED_INPUT_PREFIX):
             continue  # already rewritten by build_specs
         sources.append(value)
-        spec["input"] = f"./input/structures/{Path(value).name}"
+        spec["input"] = f"{STAGED_INPUT_PREFIX}{Path(value).name}"
     return specs, sources
