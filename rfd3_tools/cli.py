@@ -259,6 +259,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     over_tier = run_rfd3 and generate.exceeds_largest_tier(clu, max_length)
 
+    # Smallest partial_t across specs -- the least discount, so the estimate
+    # stays conservative when a job mixes partial and full diffusion.
+    partial_ts = [
+        float(s["partial_t"]) for s in specs.values() if s.get("partial_t") is not None
+    ]
+    job_partial_t = min(partial_ts) if partial_ts and len(partial_ts) == len(specs) else None
+
     if args.walltime:
         walltime = args.walltime
         seconds = 0
@@ -270,6 +277,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             n_specs=len(specs) if run_rfd3 else 1,
             timesteps=args.timesteps if run_rfd3 else 0,
             timing=timing,
+            partial_t=job_partial_t,
+            # backbones x sequences each. For --mpnn-only the backbone count
+            # lives on the cluster and is unknown here, so this under-counts;
+            # pass --time for large re-sequencing runs.
+            n_sequences=(
+                batch_size * n_batches * max(len(specs), 1) * args.mpnn_seqs
+                if run_mpnn and run_rfd3
+                else 0
+            ),
         )
         walltime = generate.format_walltime(seconds)
 
@@ -423,6 +439,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         submit += f" --jobs-dir {clu.jobs_dir}"
     print("submit with:")
     print(f"  {submit}")
+    # Resubmits are common after a fast validation failure, and hpcjob prompts
+    # when the remote dir exists.
+    print(f"  {submit} --overwrite      # if resubmitting into the same dir")
+    print()
+    # `pull` defaults to ./<name>/, which is not the job dir the results belong
+    # to; --dest puts output/ next to the inputs that produced it.
+    print("fetch results with:")
+    print(f"  hpcjob pull {name} --cluster {clu.name} --dest {out_dir} --yes")
     return 0
 
 

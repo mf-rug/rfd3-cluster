@@ -100,6 +100,22 @@ from an exit trap).
 - The walltime model is fitted to A100 at 200 timesteps and has a `safety_factor`
   of 2. H100 is ~1.4–1.6× faster; no per-tier speed factor is applied yet
   (`estimate_seconds` accepts `gpu_speedup` but the CLI never passes it).
+- **`partial_t` scales time, never memory.** A partial-diffusion run executes
+  only the tail of the schedule (measured: 2 specs × 8 designs × 442 tokens at
+  `timesteps=200`, `partial_t=10` → 6.5 min including MPNN), so the estimate is
+  multiplied by `partial_t / partial_t_reference`. Peak VRAM is set by the
+  pairwise activation in a *single* forward pass and is identical at every
+  timestep — tier selection must never use `partial_t`.
+- **MPNN shares the job's walltime** and is modelled separately
+  (`mpnn_load_seconds` + `sec_per_sequence_per_100aa` × sequences × length).
+  In the reference run it was roughly half the total. For `--mpnn-only` the
+  backbone count lives on the cluster, so the estimate under-counts — pass
+  `--time` for large re-sequencing runs.
+- **A100 evidence beyond the grid**: 442 tokens (440 res + NAD, 2 chains,
+  3436 atoms) ran on an A100-**40 GB** without OOM. That is a pass/fail
+  observation — no peak-VRAM number was captured — but it means the real cliff
+  is above the configured `max_length: 400`, not at it. The boundary between
+  442 and 600 remains unmeasured.
 
 ## Known provisional bits
 

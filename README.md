@@ -115,6 +115,11 @@ it holds free per-design QC (`n_chainbreaks`, interresidue clash counts,
 spending MPNN or folding time on a bad backbone. The summary log reports how
 many designs came out clean.
 
+Chainbreaks already present in the **input** (unmodelled loops in a crystal
+structure) are subtracted first, so the count reflects the design rather than
+the template — otherwise every design built on a normal crystal reads as
+failed.
+
 ## How the job is structured
 
 1. `module load` + venv activate + `FOUNDRY_CHECKPOINT_DIRS` export (weights

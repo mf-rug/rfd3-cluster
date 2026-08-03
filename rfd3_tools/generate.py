@@ -110,6 +110,24 @@ def exceeds_largest_tier(cluster, max_length: int) -> bool:
     return max_length > max(int(t.get("max_length", 0)) for t in cluster.gpu_tiers)
 
 
+def partial_step_fraction(partial_t: Optional[float], timing) -> float:
+    """Fraction of the denoising schedule a partial-diffusion run executes.
+
+    With `partial_t` set, sampling starts from a low noise level instead of
+    pure noise, so only the tail of the schedule runs -- far cheaper than the
+    timestep count implies (measured: 2 specs x 8 designs x 442 tokens at
+    timesteps=200, partial_t=10, finished in 6.5 min including MPNN).
+
+    Memory is *not* affected: peak VRAM is set by the pairwise activation in a
+    single forward pass, which is identical at every timestep. This scales time
+    only -- never feed it into tier selection.
+    """
+    if not partial_t or partial_t <= 0:
+        return 1.0
+    reference = max(getattr(timing, "partial_t_reference", 20.0), 1e-6)
+    return min(1.0, float(partial_t) / reference)
+
+
 def estimate_seconds(
     *,
     length: int,
@@ -119,6 +137,8 @@ def estimate_seconds(
     timesteps: int,
     timing,
     gpu_speedup: float = 1.0,
+    partial_t: Optional[float] = None,
+    n_sequences: int = 0,
 ) -> int:
     """Wall-time estimate from the measured cost structure.
 
@@ -134,13 +154,28 @@ def estimate_seconds(
     linear in wall time (memory is what grows quadratically).
     """
     length_factor = max(length, 1) / 100.0
-    step_factor = max(timesteps, 1) / max(timing.ref_timesteps, 1)
+    step_factor = (max(timesteps, 1) / max(timing.ref_timesteps, 1)) * partial_step_fraction(
+        partial_t, timing
+    )
 
     per_batch = length_factor * (
         timing.sec_per_batch_per_100aa + timing.sec_per_design_per_100aa * batch_size
     )
     compute = per_batch * n_batches * max(n_specs, 1) * step_factor
-    seconds = (timing.load_seconds + compute / max(gpu_speedup, 0.1)) * timing.safety_factor
+    total = timing.load_seconds + compute / max(gpu_speedup, 0.1)
+
+    # MPNN runs in the same job and is not free: in the reference run it was
+    # roughly half the wall time. One model load plus a per-sequence cost that
+    # scales with chain length.
+    if n_sequences:
+        total += getattr(timing, "mpnn_load_seconds", 20.0)
+        total += (
+            getattr(timing, "sec_per_sequence_per_100aa", 0.3)
+            * n_sequences
+            * length_factor
+        )
+
+    seconds = total * timing.safety_factor
     return max(int(math.ceil(seconds)), timing.min_minutes * 60)
 
 

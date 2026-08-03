@@ -106,13 +106,22 @@ clusters:
 #             * (timesteps/ref_timesteps) * safety_factor
 # The per-batch term dominates the per-design term -- that is the measured
 # result that raising diffusion_batch_size is nearly free.
+#
+# A partial-diffusion run (partial_t set) executes only the tail of the
+# schedule, so the estimate is scaled by partial_t / partial_t_reference.
+# This affects TIME only -- peak VRAM is unchanged, so tier selection must
+# never use it.
 timing:
   load_seconds: 30
   sec_per_batch_per_100aa: 12
   sec_per_design_per_100aa: 2.2
   ref_timesteps: 200
+  partial_t_reference: 20
+  # MPNN shares the job's walltime: one model load + per-sequence cost.
+  mpnn_load_seconds: 20
+  sec_per_sequence_per_100aa: 0.3
   safety_factor: 2.0
-  min_minutes: 20
+  min_minutes: 10
 """
 
 
@@ -147,8 +156,16 @@ class Timing:
     sec_per_batch_per_100aa: float = 12.0
     sec_per_design_per_100aa: float = 2.2
     ref_timesteps: int = 200
+    # Noise level at which a partial-diffusion run costs the full schedule.
+    # `partial_t` below this scales the estimate down proportionally.
+    partial_t_reference: float = 20.0
+    # MPNN runs in the same job: one model load plus a per-sequence cost.
+    mpnn_load_seconds: float = 20.0
+    sec_per_sequence_per_100aa: float = 0.3
     safety_factor: float = 2.0
-    min_minutes: int = 20
+    # Over-requesting walltime worsens scheduling priority, so the floor is
+    # kept modest; safety_factor already absorbs variance.
+    min_minutes: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +276,11 @@ def load(cluster_name: Optional[str] = None, path: Path = CONFIG_PATH):
         sec_per_batch_per_100aa=float(t.get("sec_per_batch_per_100aa", 12)),
         sec_per_design_per_100aa=float(t.get("sec_per_design_per_100aa", 2.2)),
         ref_timesteps=int(t.get("ref_timesteps", 200)),
+        partial_t_reference=float(t.get("partial_t_reference", 20.0)),
+        mpnn_load_seconds=float(t.get("mpnn_load_seconds", 20.0)),
+        sec_per_sequence_per_100aa=float(t.get("sec_per_sequence_per_100aa", 0.3)),
         safety_factor=float(t.get("safety_factor", 2.0)),
-        min_minutes=int(t.get("min_minutes", 20)),
+        min_minutes=int(t.get("min_minutes", 10)),
     )
     return cluster, timing
 

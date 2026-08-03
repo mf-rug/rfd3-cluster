@@ -130,6 +130,68 @@ def _mpnn_summary(root: Path) -> Dict[str, Any]:
     return summary
 
 
+def _ca_coords_by_chain(text: str) -> Dict[str, List[Tuple[float, float, float]]]:
+    """CA coordinates per chain from a PDB, first model only."""
+    chains: Dict[str, List[Tuple[float, float, float]]] = {}
+    for line in text.splitlines():
+        if line.startswith("ENDMDL"):
+            break
+        if not line.startswith("ATOM") or line[12:16].strip() != "CA":
+            continue
+        try:
+            xyz = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+        except ValueError:
+            continue
+        chains.setdefault(line[21], []).append(xyz)
+    return chains
+
+
+def _count_chainbreaks(path: Path) -> Optional[int]:
+    """Chainbreaks in a structure: consecutive CA pairs further apart than a
+    peptide bond allows (~3.8 A; 4.5 A leaves room for strain).
+
+    Crystal structures routinely have unmodelled loops, which RFD3 reports as
+    chainbreaks in the *design* too. Without this baseline the QC count
+    describes the input, not the design.  Returns None on anything unreadable
+    -- this runs from an exit trap and must never raise.
+    """
+    try:
+        if path.name.lower().endswith(".gz"):
+            import gzip
+
+            text = gzip.open(path, "rt", errors="replace").read()
+        else:
+            text = path.read_text(errors="replace")
+    except (OSError, ValueError):
+        return None
+    if not path.name.lower().endswith((".pdb", ".pdb.gz")):
+        return None  # mmCIF baseline not supported; caller degrades gracefully
+
+    breaks = 0
+    for coords in _ca_coords_by_chain(text).values():
+        for (x1, y1, z1), (x2, y2, z2) in zip(coords, coords[1:]):
+            if ((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2) ** 0.5 > 4.5:
+                breaks += 1
+    return breaks
+
+
+def _input_chainbreak_baseline(job_dir: Path) -> Optional[int]:
+    """Chainbreaks already present in the job's input structure(s).
+
+    Takes the maximum across staged inputs: a design is only credited for
+    breaks it did not inherit.
+    """
+    struct_dir = job_dir / "input" / "structures"
+    if not struct_dir.is_dir():
+        return None
+    counts = [
+        n
+        for n in (_count_chainbreaks(p) for p in sorted(struct_dir.iterdir()) if p.is_file())
+        if n is not None
+    ]
+    return max(counts) if counts else None
+
+
 def _extract_errors(text: str, max_blocks: int = 5, context: int = 12) -> List[str]:
     """Pull out distinct error blocks.
 
@@ -222,20 +284,32 @@ def summarize(job_dir: str | Path, epilog_marker: str = "") -> Optional[Path]:
     lines.append("")
     lines.append(f"designs  : {n_designs} structure(s) in output/rfd3")
 
-    # Free QC pre-filter: a backbone with chainbreaks or clashes is not worth
-    # spending MPNN/RF3 time on.
+    # Free QC pre-filter: a backbone with *introduced* chainbreaks or any clash
+    # is not worth spending MPNN/RF3 time on.  Breaks inherited from an input
+    # with unmodelled loops say nothing about the design, so they are subtracted
+    # -- otherwise every design from a normal crystal reads as failed.
+    baseline = _input_chainbreak_baseline(job_dir) or 0
     flagged = [
         e["name"]
         for e in metadata
-        if (e.get("n_chainbreaks") or 0)
+        if max((e.get("n_chainbreaks") or 0) - baseline, 0)
         or (e.get("interresidue_clashes_w_backbone") or 0)
         or (e.get("interresidue_clashes_w_sidechain") or 0)
     ]
     if metadata:
-        lines.append(
-            f"  QC     : {len(metadata) - len(flagged)}/{len(metadata)} clean "
-            f"(no chainbreaks, no clashes)"
+        qualifier = (
+            f"no clashes, no chainbreaks beyond the input's {baseline}"
+            if baseline
+            else "no chainbreaks, no clashes"
         )
+        lines.append(
+            f"  QC     : {len(metadata) - len(flagged)}/{len(metadata)} clean ({qualifier})"
+        )
+        if baseline:
+            lines.append(
+                f"           input structure already has {baseline} chainbreak(s) "
+                f"-- unmodelled loops, not a design defect"
+            )
         if flagged:
             lines.append(f"  flagged: {', '.join(flagged[:10])}"
                          + (f" ... +{len(flagged) - 10}" if len(flagged) > 10 else ""))
