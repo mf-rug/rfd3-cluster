@@ -1,0 +1,7 @@
+#!/bin/bash
+# Generate an RFD3 (+ MPNN) Slurm job directory.
+# Resolve the directory this script lives in (works even via a PATH symlink).
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    exec python3 -c "from rfd3_tools.cli import main; raise SystemExit(main())" "$@"

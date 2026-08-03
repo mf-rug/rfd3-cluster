@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Machine-local copy of the handoff with real allocation ids / paths.
+# The committed HANDOFF.md uses <PROJECT> placeholders.
+HANDOFF.local.md
+
+# Generated job directories, if anyone works inside the repo.
+*/job.sh
+*/input/
+*/output/
