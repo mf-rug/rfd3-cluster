@@ -423,6 +423,54 @@ def expand_residue_selection(selection: str) -> List[str]:
     return out
 
 
+AA_ONE_TO_THREE = {
+    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN",
+    "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS",
+    "M": "MET", "F": "PHE", "P": "PRO", "S": "SER", "T": "THR", "W": "TRP",
+    "Y": "TYR", "V": "VAL",
+}
+
+
+def parse_residue_constraints(text: str, allow: bool) -> Dict[str, List[str]]:
+    """`"A801:DE,A828:RK"` -> MPNN's `omit_per_residue` dict.
+
+    Two ways to constrain a position, both expressed as omissions because that
+    is the only per-residue lever MPNN exposes:
+
+      allow=False  omit exactly the listed types      (A828:RK -> no Arg/Lys)
+      allow=True   omit everything *except* them      (A801:DE -> only Asp/Glu)
+
+    The "allow" form is how a residue is forced: it is what produced Glu787 +
+    Gln814 in the MmCAR line. Left unconstrained, MPNN restores the wild-type
+    pocket residue essentially every time (256/256 in the first cluster run),
+    so a cofactor-specificity switch cannot be reached without this.
+
+    Residue IDs accept ranges (`A799-804:DE`) and are expanded. UNK is always
+    omitted, matching MPNN's own default, which `omit_per_residue` overrides.
+    """
+    out: Dict[str, List[str]] = {}
+    for token in re.split(r"[,\s]+", text.strip()):
+        if not token:
+            continue
+        if ":" not in token:
+            raise SpecError(
+                f"constraint {token!r} must look like 'A801:DE' "
+                f"(residue id, colon, one-letter amino acids)")
+        ids, letters = token.split(":", 1)
+        letters = letters.strip().upper()
+        unknown = [c for c in letters if c not in AA_ONE_TO_THREE]
+        if unknown or not letters:
+            raise SpecError(
+                f"constraint {token!r}: {'unknown amino acid ' + ''.join(unknown)
+                                          if unknown else 'no amino acids given'}")
+        listed = {AA_ONE_TO_THREE[c] for c in letters}
+        omitted = sorted(set(AA_ONE_TO_THREE.values()) - listed) if allow else sorted(listed)
+        for res_id in expand_residue_selection(ids):
+            out.setdefault(res_id, [])
+            out[res_id] = sorted(set(out[res_id]) | set(omitted) | {"UNK"})
+    return out
+
+
 def designed_residues_by_spec(
     specs: Dict[str, Dict[str, Any]],
 ) -> Dict[str, List[str]]:

@@ -157,6 +157,7 @@ def build_config(
     write_fasta: bool = True,
     designed_residues: Optional[List[str]] = None,
     designed_map: Optional[Dict[str, List[str]]] = None,
+    omit_per_residue: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     inputs: List[Dict[str, Any]] = []
     for path in structures:
@@ -177,6 +178,11 @@ def build_config(
         scope = designed_residues or designed_for(stem, designed_map or {})
         if scope:
             entry["designed_residues"] = list(scope)
+        # Per-position amino-acid constraints. This is how a residue is forced:
+        # MPNN otherwise restores the wild-type pocket residue almost every
+        # time, so a specificity switch is unreachable without it.
+        if omit_per_residue:
+            entry["omit_per_residue"] = {k: list(v) for k, v in omit_per_residue.items()}
         inputs.append(entry)
 
     return {
@@ -224,6 +230,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="File mapping spec name -> list of residue IDs, applied "
                          "per backbone by matching the spec name in its filename. "
                          "Written by rfd3-setup-job from select_unfixed_sequence.")
+    ap.add_argument("--omit-per-residue-map", default=None, metavar="JSON",
+                    help="File mapping residue ID -> amino acids to omit there, "
+                         "e.g. {\"A801\": [\"ALA\", ...]}. Written by "
+                         "rfd3-setup-job from --mpnn-force / --mpnn-forbid.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -260,6 +270,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"warning: {map_path} not found; MPNN will design every residue",
                   file=sys.stderr)
 
+    omit_map: Dict[str, List[str]] = {}
+    if args.omit_per_residue_map:
+        omit_path = Path(args.omit_per_residue_map)
+        if omit_path.is_file():
+            omit_map = json.loads(omit_path.read_text())
+        elif not args.quiet:
+            print(f"warning: {omit_path} not found; no residue constraints applied",
+                  file=sys.stderr)
+
     config = build_config(
         structures=structures,
         model_type=args.model_type,
@@ -271,6 +290,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_structures=not args.no_write_structures,
         designed_residues=designed,
         designed_map=designed_map,
+        omit_per_residue=omit_map,
     )
 
     scoped = sum(1 for i in config["inputs"] if i.get("designed_residues"))

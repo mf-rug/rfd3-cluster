@@ -110,6 +110,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "everything else is held fixed. Default: derived from each "
                         "spec's select_unfixed_sequence, so MPNN designs exactly "
                         "what RFD3 was allowed to change.")
+    m.add_argument("--mpnn-force", default=None, metavar="SPEC",
+                   help="Force amino acids at positions, 'A801:DE' = only Asp or "
+                        "Glu at 801 (repeatable via commas). Implemented as "
+                        "omit-everything-else, MPNN's only per-residue lever. "
+                        "Needed for a specificity switch: unconstrained, MPNN "
+                        "restores the wild-type pocket residue nearly every time.")
+    m.add_argument("--mpnn-forbid", default=None, metavar="SPEC",
+                   help="Forbid amino acids at positions, e.g. 'A828:RK' = no Arg "
+                        "or Lys at 828.")
     m.add_argument("--mpnn-design-all", action="store_true",
                    help="Let MPNN redesign every residue (its own default). Only "
                         "sensible for de-novo backbones -- on a scaffold redesign "
@@ -329,6 +338,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.mpnn_designed:
         designed_summary = args.mpnn_designed
 
+    omit_map_path = None
+    omit_constraints = {}
+    if run_mpnn and (args.mpnn_force or args.mpnn_forbid):
+        try:
+            if args.mpnn_force:
+                omit_constraints.update(
+                    spec_mod.parse_residue_constraints(args.mpnn_force, allow=True))
+            if args.mpnn_forbid:
+                for res_id, omitted in spec_mod.parse_residue_constraints(
+                        args.mpnn_forbid, allow=False).items():
+                    omit_constraints[res_id] = sorted(
+                        set(omit_constraints.get(res_id, [])) | set(omitted))
+        except spec_mod.SpecError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        omit_map_path = "./input/mpnn_omit.json"
+
     # ---- write the job dir ------------------------------------------------
     out_dir: Path = args.out_dir
     (out_dir / "input").mkdir(parents=True, exist_ok=True)
@@ -339,6 +365,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if designed_map_path:
         (out_dir / "input" / "mpnn_designed.json").write_text(
             json.dumps(spec_mod.designed_residues_by_spec(specs), indent=2))
+
+    if omit_map_path:
+        (out_dir / "input" / "mpnn_omit.json").write_text(
+            json.dumps(omit_constraints, indent=2))
 
     if sources or local_structure_dir:
         struct_dir = out_dir / "input" / "structures"
@@ -385,6 +415,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_structures=not args.no_mpnn_structures,
         designed_residues=args.mpnn_designed,
         designed_map=designed_map_path,
+        omit_map=omit_map_path,
     )
 
     slurm = generate.SlurmParams(
@@ -419,6 +450,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"length    : {max_length} residues ({length_origin})")
     if run_mpnn:
         print(f"mpnn scope: {designed_summary}")
+        if omit_constraints:
+            forced = ", ".join(f"{k}({20 - len(v) + 1} allowed)"
+                               for k in sorted(omit_constraints)[:6]
+                               for v in [omit_constraints[k]])
+            print(f"mpnn constr: {len(omit_constraints)} position(s) -- {forced}")
         print(f"mpnn      : {args.mpnn_model}, {mpnn_batch * mpnn_nbatches} seq/backbone "
               f"from {mpnn_structures}")
     print(f"resources : {partition_name}, {gpu_sbatch}, {mem}, {cpus} cpus, "

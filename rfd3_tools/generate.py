@@ -67,6 +67,8 @@ class MpnnParams:
     # derived from each spec's select_unfixed_sequence so the two cannot drift.
     designed_residues: Optional[str] = None
     designed_map: Optional[str] = None
+    # Per-position amino-acid constraints (forcing/forbidding residue types).
+    omit_map: Optional[str] = None
     extra_args: Optional[List[str]] = None
 
 
@@ -306,6 +308,8 @@ def _mpnn_stage(m: MpnnParams, checkpoint_dir: str, venv_bin: str) -> str:
         extra += f"    --designed-residues '{m.designed_residues}' \\\n"
     if m.designed_map:
         extra += f"    --designed-residues-map '{m.designed_map}' \\\n"
+    if m.omit_map:
+        extra += f"    --omit-per-residue-map '{m.omit_map}' \\\n"
     for arg in m.extra_args or []:
         extra += f"    {arg} \\\n"
 
