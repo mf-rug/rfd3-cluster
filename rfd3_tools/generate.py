@@ -3,6 +3,10 @@
 Nothing here knows a partition or GPU name: every choice comes from the
 selected cluster's config block, which is what makes the same generator emit a
 correct script for any Slurm cluster.
+
+Calibrated against measurements from the Snellius install (2026-08-03):
+RFD3 VRAM grows ~L^2 with design length and is almost independent of
+diffusion batch size, so length picks the GPU tier and batching is cheap.
 """
 
 from __future__ import annotations
@@ -10,8 +14,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-
-from .cluster import Cluster, Timing
 
 # Default MPNN checkpoint *patterns*, resolved by glob on the cluster at job
 # time rather than hardcoded here -- filenames carry version numbers
@@ -68,8 +70,14 @@ class MpnnParams:
 # ---------------------------------------------------------------------------
 
 
-def recommend_gpu(cluster: Cluster, max_length: int) -> Tuple[str, str, bool]:
-    """(gpu_sbatch, mem, warn) for the largest design in the job."""
+def recommend_gpu(cluster, max_length: int) -> Tuple[str, str, bool]:
+    """(gpu_sbatch, mem, warn) for the largest design in the job.
+
+    `max_length` is the selector because VRAM is set by design length (~L^2),
+    not by how many designs are sampled at once. Tiers are a hard cliff: RFD3
+    dies with a single large allocation in the pairwise embedding rather than
+    degrading gracefully, so a job one residue over the limit OOMs in seconds.
+    """
     if not cluster.gpu_tiers:
         raise RuntimeError(
             f"Cluster {cluster.name!r} has no gpu_tiers configured -- add them "
@@ -86,21 +94,48 @@ def recommend_gpu(cluster: Cluster, max_length: int) -> Tuple[str, str, bool]:
     return (
         str(last.get("gpu_sbatch", "")),
         str(last.get("mem", "32GB")),
-        bool(last.get("warn", False)),
+        bool(last.get("warn", True)),
     )
 
 
-def estimate_seconds(
-    *, designs: int, length: int, timesteps: int, timing: Timing
-) -> int:
-    """Provisional cost model -- linear in designs x length x timesteps.
+def exceeds_largest_tier(cluster, max_length: int) -> bool:
+    """True when no configured tier covers this design length."""
+    if not cluster.gpu_tiers:
+        return False
+    return max_length > max(int(t.get("max_length", 0)) for t in cluster.gpu_tiers)
 
-    The constant lives in config (`timing.sec_per_unit`) precisely because it
-    is a guess until the cluster reports measured timings; recalibrating is a
-    one-line config edit, not a code change.
+
+def estimate_seconds(
+    *,
+    length: int,
+    batch_size: int,
+    n_batches: int,
+    n_specs: int,
+    timesteps: int,
+    timing,
+    gpu_speedup: float = 1.0,
+) -> int:
+    """Wall-time estimate from the measured cost structure.
+
+    Three components, all in config:
+
+    - a fixed model-load cost (~20 s for the 2.5 GB checkpoint) paid once;
+    - a per-batch cost that scales with length;
+    - a per-design cost that scales with length.
+
+    The per-design term is much smaller than the per-batch term, which is the
+    measured result that batching is nearly free: at L=200 one design costs
+    ~28 s of compute and eight cost ~58 s, not 8x.  Length scaling is taken as
+    linear in wall time (memory is what grows quadratically).
     """
-    units = designs * (length / 100.0) * (timesteps / 100.0)
-    seconds = units * timing.sec_per_unit * timing.safety_factor
+    length_factor = max(length, 1) / 100.0
+    step_factor = max(timesteps, 1) / max(timing.ref_timesteps, 1)
+
+    per_batch = length_factor * (
+        timing.sec_per_batch_per_100aa + timing.sec_per_design_per_100aa * batch_size
+    )
+    compute = per_batch * n_batches * max(n_specs, 1) * step_factor
+    seconds = (timing.load_seconds + compute / max(gpu_speedup, 0.1)) * timing.safety_factor
     return max(int(math.ceil(seconds)), timing.min_minutes * 60)
 
 
@@ -111,7 +146,7 @@ def format_walltime(seconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def recommend_partition(cluster: Cluster, gpu_sbatch: str, seconds: int) -> str:
+def find_partition(cluster, gpu_sbatch: str, seconds: int) -> Dict[str, Any]:
     """Smallest partition that offers this GPU and is long enough."""
     hours = seconds / 3600.0
     candidates = [
@@ -133,14 +168,30 @@ def recommend_partition(cluster: Cluster, gpu_sbatch: str, seconds: int) -> str:
             f"({longest.get('name')}: {longest.get('max_hours')} h). "
             f"Split the job (fewer designs per job) or pass --time/--partition."
         )
-    return str(min(fitting, key=lambda p: float(p.get("max_hours", 0)))["name"])
+    return min(fitting, key=lambda p: float(p.get("max_hours", 0)))
 
 
-def cap_walltime(cluster: Cluster, partition: str, seconds: int) -> int:
+def partition_by_name(cluster, name: str) -> Optional[Dict[str, Any]]:
     for p in cluster.partitions:
-        if str(p.get("name")) == partition:
-            return min(seconds, int(float(p.get("max_hours", 0)) * 3600))
-    return seconds
+        if str(p.get("name")) == name:
+            return p
+    return None
+
+
+def cap_cpus(partition: Optional[Dict[str, Any]], requested: Optional[int]) -> int:
+    """Respect the QOS core-per-GPU ceiling.
+
+    Slurm rejects the job outright (`QOSMaxCpuPerJobLimit`) when a partition's
+    per-GPU core share is exceeded -- e.g. 9 cores alongside one MIG slice.
+    GPU nodes are charged per GPU, so when no explicit request is made we take
+    the full allowance rather than leaving free cores on the table.
+    """
+    ceiling = None
+    if partition and partition.get("cpus_per_gpu"):
+        ceiling = int(partition["cpus_per_gpu"])
+    if requested is None:
+        return ceiling if ceiling else 8
+    return min(requested, ceiling) if ceiling else requested
 
 
 # ---------------------------------------------------------------------------
@@ -148,9 +199,25 @@ def cap_walltime(cluster: Cluster, partition: str, seconds: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _rfd3_command(p: Rfd3Params) -> str:
+def _hydra_override(item: str) -> str:
+    """Prefix `+` where Hydra needs it to *add* a key rather than modify one.
+
+    `specification` is declared as an empty mapping in
+    `inference_engine/rfdiffusion3.yaml`, and OmegaConf runs in struct mode, so
+    `specification.length=60` fails with `Key 'length' is not in struct`; it
+    must be `+specification.length=60`. Every other key already exists in the
+    config, where a `+` is equally an error. Two classes, not one.
+    """
+    if item.startswith(("+", "~")):
+        return item
+    if item.startswith("specification."):
+        return "+" + item
+    return item
+
+
+def _rfd3_command(p: Rfd3Params, venv_bin: str) -> str:
     parts = [
-        'python -c "from rfd3.cli import app; app()" design',
+        f"{venv_bin}/rfd3 design",
         f"    inputs={p.inputs}",
         f"    out_dir={p.out_dir}",
         f"    diffusion_batch_size={p.diffusion_batch_size}",
@@ -168,17 +235,21 @@ def _rfd3_command(p: Rfd3Params) -> str:
     if p.low_memory_mode:
         parts.append("    low_memory_mode=True")
     for override in p.extra_overrides or []:
-        parts.append(f"    {override}")
+        parts.append(f"    {_hydra_override(override)}")
     return " \\\n".join(parts)
 
 
-def _mpnn_stage(m: MpnnParams, checkpoint_dir: str) -> str:
+def _mpnn_stage(m: MpnnParams, checkpoint_dir: str, venv_bin: str) -> str:
     """Build the MPNN stage.
 
     The config JSON is built *on the cluster*, after RFD3 has run, because the
     backbone filenames don't exist at generation time.  One `mpnn` process then
     handles every backbone via its native batch interface (`--config_json` with
     an `inputs: [...]` list), so the model loads once instead of per structure.
+
+    RFD3 writes gzipped mmCIF (`.cif.gz`).  Whether MPNN reads that directly is
+    unverified, so the helper stages decompressed copies and points MPNN at
+    those -- cheap, and it removes the unknown.
     """
     ckpt_arg = (
         f"    --checkpoint {m.checkpoint} \\\n"
@@ -196,32 +267,35 @@ def _mpnn_stage(m: MpnnParams, checkpoint_dir: str) -> str:
 
     return f"""
 # --- stage 2: MPNN sequence design over every backbone (single process) ---
-PYTHONPATH="$_job_dir" python -m rfd3_tools mpnn-config \\
+PYTHONPATH="$_job_dir" {venv_bin}/python -m rfd3_tools mpnn-config \\
     --structures '{m.structures}' \\
     --out ./input/mpnn.json \\
     --model-type {m.model_type} \\
     --out-directory '{m.out_dir}' \\
+    --gunzip-to ./output/staged_cif \\
     --batch-size {m.batch_size} \\
     --number-of-batches {m.number_of_batches} \\
 {ckpt_arg}{extra}    --quiet
 
-python -c "from mpnn.inference import main; main()" --config_json ./input/mpnn.json
+{venv_bin}/mpnn --config_json ./input/mpnn.json
 """
 
 
 def build_job_script(
     *,
-    cluster: Cluster,
+    cluster,
     slurm: SlurmParams,
     rfd3: Optional[Rfd3Params],
     mpnn: MpnnParams,
 ) -> str:
     """Emit a portable Slurm script for the selected cluster.
 
-    Portability rules (learned from the boltz job scripts):
+    Portability rules:
     - use `$SLURM_SUBMIT_DIR`, never a path baked in at generation time;
-    - invoke via the venv's `python -c`, so a stray `rfd3`/`mpnn` binary
-      earlier on `PATH` can't shadow the venv's interpreter;
+    - call binaries by **absolute venv path**, which is immune to `PATH`
+      ordering and to a missing `module load`, and avoids `rfd3/cli.py`
+      stripping literal `design`/`fold` tokens from the argument list as the
+      `python -c` form does;
     - never let the exit trap fail the job.
     """
     if not cluster.venv_path:
@@ -229,27 +303,33 @@ def build_job_script(
             f"Cluster {cluster.name!r} has no venv.path configured. The Foundry "
             f"install must be completed first (see HANDOFF.md)."
         )
+    venv_bin = f"{cluster.venv_path.rstrip('/')}/bin"
 
     stages = []
     if rfd3 is not None:
         stages.append(
             f"""
 # --- stage 1: RFD3 backbone generation ---
-{_rfd3_command(rfd3)}
+{_rfd3_command(rfd3, venv_bin)}
 """
         )
     if mpnn.enabled:
-        stages.append(_mpnn_stage(mpnn, cluster.checkpoint_dir))
+        stages.append(_mpnn_stage(mpnn, cluster.checkpoint_dir, venv_bin))
 
-    # What counts as "the job produced something".
+    # What counts as "the job produced something".  RFD3 emits gzipped mmCIF
+    # (`*.cif.gz`), never PDB -- checking for `*.cif` alone would report every
+    # successful run as a failure.
     if rfd3 is not None:
         success_dir = rfd3.out_dir
-        success_pat = r"-name '*.pdb' -o -name '*.cif'"
+        success_pat = r"-name '*.cif.gz' -o -name '*.cif' -o -name '*.pdb'"
     else:
         success_dir = mpnn.out_dir
         success_pat = r"-name '*.fa' -o -name '*.cif'"
 
+    module_line = f"module purge\nmodule load {cluster.python_module}\n" if cluster.python_module else ""
     checkpoint_export = (
+        f'# No fallback: foundry writes nothing to $HOME, so a missing export\n'
+        f'# means no checkpoint is discoverable at all.\n'
         f'export FOUNDRY_CHECKPOINT_DIRS="{cluster.checkpoint_dir}"\n'
         if cluster.checkpoint_dir
         else ""
@@ -292,18 +372,18 @@ cleanup() {{
     echo "========================================="
     # Clean summary log; best-effort, never fails the job.
     # rfd3_tools/ ships alongside job.sh, so no cluster-side install is needed.
-    PYTHONPATH="$_job_dir" python -m rfd3_tools log "$_job_dir" || true
+    PYTHONPATH="$_job_dir" {venv_bin}/python -m rfd3_tools log "$_job_dir" || true
 }}
 trap cleanup EXIT
 
 echo "start $(date)"
 
-module purge
-module load {cluster.python_module}
-source {cluster.venv_path}/bin/activate
-
+{module_line}
 {checkpoint_export}
 nvidia-smi || true
+# `PYTORCH_ALLOC_CONF` is the current spelling in torch 2.10; the legacy name
+# is set too so the script behaves the same on older stacks.
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd "$_job_dir"

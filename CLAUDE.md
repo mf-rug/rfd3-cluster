@@ -37,6 +37,25 @@ from an exit trap).
   Config keys live in `rfd3/configs/inference_engine/rfdiffusion3.yaml`
   (`@package _global_`, so `num_timesteps` is at `inference_sampler.num_timesteps`,
   not top level). Designs per spec = `diffusion_batch_size × n_batches`.
+- **`specification.*` overrides need a leading `+`; everything else must not
+  have one.** `specification` is an empty mapping in the config and OmegaConf
+  runs in struct mode, so `specification.length=60` fails with
+  `Key 'length' is not in struct`. `generate._hydra_override()` applies this
+  rule to `--rfd3-set` passthroughs.
+- **RFD3 writes gzipped mmCIF (`*.cif.gz`), never PDB**, plus a sibling `.json`
+  holding per-design QC metrics (`n_chainbreaks`, interresidue clash counts,
+  `helix_fraction`, `radius_of_gyration`, `sampled_contig`). Any code that
+  globs for results must match `.cif.gz` — this was a live bug caught by the
+  Snellius install report. The log parser surfaces the QC metrics as a
+  clean/flagged count.
+- **VRAM scales ~L² with design length and is ~independent of batch size**
+  (measured: L100 3.4 GB, L200 8.0 GB, L400 26 GB, L600 57 GB; batch 1→8 costs
+  ~1% more VRAM for 8× the designs). So length picks the GPU tier, batching is
+  nearly free, and `max_length` is a hard OOM cliff — RFD3 dies on one big
+  allocation in the pairwise embedding rather than degrading.
+- **Invoke by absolute `<venv>/bin/…` path.** Immune to `PATH` ordering and to a
+  missing `module load`, and it avoids `rfd3/cli.py` stripping literal
+  `design`/`fold` tokens from the argument list (the `python -c` form's trap).
 - **MPNN CLI** takes either one `--structure_path` or `--config_json`, the
   latter being `{globals…, "inputs": [ {structure_path, name, …}, … ]}`. The
   batch form is what the job uses: one process, model loaded once.
@@ -61,13 +80,30 @@ from an exit trap).
   change made there was a `--jobs-dir` flag on `submit`, so RFD3 jobs land in
   `rfd3_jobs/` without needing duplicate cluster entries.
 
+## State of calibration
+
+- **Snellius: measured.** `gpu_tiers` and the `timing` constants come from the
+  install report of 2026-08-03 (length × batch grid on A100 / H100 / A100-MIG).
+  Caveats stated there: the MIG `max_length: 200` and the H100 `max_length: 700`
+  are *inferred*, not measured at the boundary; the A100 `400` is measured on
+  both sides. Bisect before trusting the inferred ones.
+- **Hábrók: provisional.** Nothing measured. Tiers are extrapolated from the
+  Snellius VRAM curve against each card's VRAM, and `python_module` is a
+  deliberate `PLACEHOLDER-Python-3.12` — `rc-foundry` needs `>=3.12,<3.13`, so
+  the 3.11.5 Boltz module cannot be reused. Fix both after that install.
+- The walltime model is fitted to A100 at 200 timesteps and has a `safety_factor`
+  of 2. H100 is ~1.4–1.6× faster; no per-tier speed factor is applied yet
+  (`estimate_seconds` accepts `gpu_speedup` but the CLI never passes it).
+
 ## Known provisional bits
 
-- `gpu_tiers` (`max_length` thresholds) and `timing.sec_per_unit` are guesses
-  until the cluster install reports measured timings (HANDOFF.md §4.3/§4.4).
-  Recalibrate in config, not code.
 - `spec.max_design_length()` assumes 300 residues when length is implied by a
   contig rather than stated, since resolving a contig needs the structure.
-- Untested end-to-end: no job has run on a cluster yet (Foundry install pending).
-  The generator, validator, MPNN-config builder and log parser have local unit
-  coverage only.
+  With a hard OOM cliff that assumption is load-bearing — a long contig-implied
+  design can silently pick too small a GPU.
+- **Untested end-to-end: no job has run on a cluster yet.** The generator,
+  validator, MPNN-config builder and log parser have local coverage only; the
+  Snellius install itself is verified.
+- Unverified upstream: whether MPNN reads `.cif.gz` directly (the job stages
+  decompressed copies via `--gunzip-to` to sidestep it), and whether MPNN's
+  batch-JSON path names outputs like the single-`--structure_path` path.

@@ -13,8 +13,21 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-STRUCTURE_SUFFIXES = (".pdb", ".cif")
+# RFD3 writes gzipped mmCIF; plain forms are counted too.
+STRUCTURE_SUFFIXES = (".pdb", ".cif", ".cif.gz")
 EXCLUDE_MARKERS = ("_traj", "_trajectory", "_noisy", "_denoised")
+
+# Per-design metrics worth surfacing: chainbreaks and clashes are a free
+# pre-filter before spending MPNN/RF3 time on a bad backbone.
+METRIC_KEYS = (
+    "n_chainbreaks",
+    "n_clashing.interresidue_clashes_w_backbone",
+    "n_clashing.interresidue_clashes_w_sidechain",
+    "radius_of_gyration",
+    "helix_fraction",
+    "sheet_fraction",
+    "num_residues",
+)
 
 ERROR_PATTERNS = (
     re.compile(r"^Traceback \(most recent call last\)", re.M),
@@ -39,11 +52,14 @@ def _count_structures(root: Path) -> Tuple[int, List[str]]:
     if not root.is_dir():
         return 0, []
     names = []
-    for suffix in STRUCTURE_SUFFIXES:
-        for p in sorted(root.rglob(f"*{suffix}")):
-            if any(marker in p.stem for marker in EXCLUDE_MARKERS):
-                continue
-            names.append(p.name)
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        if not any(p.name.lower().endswith(s) for s in STRUCTURE_SUFFIXES):
+            continue
+        if any(marker in p.name for marker in EXCLUDE_MARKERS):
+            continue
+        names.append(p.name)
     return len(names), names
 
 
@@ -62,11 +78,22 @@ def _design_metadata(root: Path) -> List[Dict[str, Any]]:
             continue
         if not isinstance(data, dict):
             continue
-        spec = data.get("input_specification") or {}
+        # Release 0.2.0 nests these under "specification"/"metrics"; older
+        # layouts used "input_specification". Accept either.
+        spec = data.get("specification") or data.get("input_specification") or {}
         entry: Dict[str, Any] = {"name": path.stem}
-        for key in ("length", "contig", "partial_t"):
-            if isinstance(spec, dict) and spec.get(key) is not None:
-                entry[key] = spec[key]
+        if isinstance(spec, dict):
+            for key in ("length", "contig", "partial_t"):
+                if spec.get(key) is not None:
+                    entry[key] = spec[key]
+            extra = spec.get("extra")
+            if isinstance(extra, dict) and extra.get("sampled_contig"):
+                entry["sampled_contig"] = extra["sampled_contig"]
+        metrics = data.get("metrics")
+        if isinstance(metrics, dict):
+            for key in METRIC_KEYS:
+                if metrics.get(key) is not None:
+                    entry[key.split(".")[-1]] = metrics[key]
         seq = data.get("sequence")
         if isinstance(seq, str) and seq:
             entry["seq_len"] = len(seq)
@@ -194,6 +221,24 @@ def summarize(job_dir: str | Path, epilog_marker: str = "") -> Optional[Path]:
 
     lines.append("")
     lines.append(f"designs  : {n_designs} structure(s) in output/rfd3")
+
+    # Free QC pre-filter: a backbone with chainbreaks or clashes is not worth
+    # spending MPNN/RF3 time on.
+    flagged = [
+        e["name"]
+        for e in metadata
+        if (e.get("n_chainbreaks") or 0)
+        or (e.get("interresidue_clashes_w_backbone") or 0)
+        or (e.get("interresidue_clashes_w_sidechain") or 0)
+    ]
+    if metadata:
+        lines.append(
+            f"  QC     : {len(metadata) - len(flagged)}/{len(metadata)} clean "
+            f"(no chainbreaks, no clashes)"
+        )
+        if flagged:
+            lines.append(f"  flagged: {', '.join(flagged[:10])}"
+                         + (f" ... +{len(flagged) - 10}" if len(flagged) > 10 else ""))
     for entry in metadata[:20]:
         bits = [f"{k}={v}" for k, v in entry.items() if k != "name"]
         lines.append(f"  - {entry['name']}" + (f"  ({', '.join(bits)})" if bits else ""))

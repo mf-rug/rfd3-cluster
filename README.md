@@ -103,10 +103,17 @@ After the run, `hpcjob pull` brings back:
 
 ```
 <out-dir>/
-  output/rfd3/           designed backbones (.pdb/.cif) + per-design .json
+  output/rfd3/           designed backbones (.cif.gz) + per-design .json
+  output/staged_cif/     decompressed copies fed to MPNN
   output/mpnn/           sequences (.fa) + designed structures (.cif)
   <name>_COMPLETED_<id>.log   clean summary written by the job's exit trap
 ```
+
+RFD3 writes **gzipped mmCIF**, never PDB. The sibling `.json` is worth keeping:
+it holds free per-design QC (`n_chainbreaks`, interresidue clash counts,
+`helix_fraction`, `radius_of_gyration`, `sampled_contig`) — a pre-filter before
+spending MPNN or folding time on a bad backbone. The summary log reports how
+many designs came out clean.
 
 ## How the job is structured
 
@@ -122,22 +129,39 @@ After the run, `hpcjob pull` brings back:
 
 ## Resource recommendation
 
-GPU tier is chosen from the largest design length; walltime from
-`designs × length × timesteps` scaled by a calibration constant. Both live in
-config:
+RFD3's VRAM grows roughly with the **square of design length** and is almost
+independent of batch size — measured on Snellius at 200 timesteps:
+
+| length | peak VRAM | batch 1 → 8 |
+|---|---|---|
+| 100 | 3.4 GB | +1 % VRAM, 8× the designs |
+| 200 | 8.0 GB | 36 s → 55 s on H100 |
+| 400 | 26 GB | |
+| 600 | 57 GB | OOMs on a 40 GB A100 |
+
+So **length picks the GPU tier and batching is nearly free**. `max_length` is a
+hard cliff, not a soft limit: RFD3 dies on a single large allocation in the
+pairwise embedding, so a job slightly over the limit fails in seconds rather
+than running slowly. The generator warns when a design exceeds every tier.
 
 ```yaml
 gpu_tiers:
-  - {max_length: 300, gpu_sbatch: l40s:1, mem: 32GB}
+  - {max_length: 200, gpu_sbatch: a100_3g.20gb:1, mem: 48GB}   # MIG, cheapest
+  - {max_length: 400, gpu_sbatch: a100:1,         mem: 64GB}
 timing:
-  sec_per_unit: 25      # recalibrate from real runs
+  sec_per_batch_per_100aa: 12     # dominates...
+  sec_per_design_per_100aa: 2.2   # ...this one — hence batching is cheap
   safety_factor: 2.0
 ```
 
-Override per job with `--gpu`, `--mem`, `--time`, `--partition`.
+Cores default to the partition's full QOS per-GPU allowance (`cpus_per_gpu`),
+since GPU nodes are charged per GPU — asking for fewer saves nothing, and
+asking for more makes Slurm reject the job.
 
-> The shipped defaults are **provisional** until benchmarked on each cluster.
-> They are deliberately in config, not code, so recalibrating is a one-line edit.
+Override per job with `--gpu`, `--mem`, `--time`, `--partition`, `--cpus`.
+
+> Snellius values are measured; Hábrók's are extrapolated placeholders until
+> that install happens. Recalibrating is a config edit, not a code change.
 
 ## See also
 

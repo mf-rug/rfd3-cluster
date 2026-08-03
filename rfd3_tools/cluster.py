@@ -35,9 +35,9 @@ CONFIG_PATH = Path(
     os.environ.get("RFD3_SETUP_CONFIG", Path.home() / ".config/rfd3-setup/config.yaml")
 )
 
-# Written on first run / `--init`.  Paths match HANDOFF.md; the GPU tiers and
-# the walltime constant are PROVISIONAL until the cluster install reports back
-# real timings (see HANDOFF.md §4.3).
+# Written on first run.  The Snellius block holds MEASURED values (install
+# report, 2026-08-03); the Habrok block is still provisional -- its tiers are
+# extrapolated from the same L^2 memory curve and must be re-measured.
 DEFAULT_CONFIG = """\
 # rfd3-setup cluster configuration (multi-cluster).
 # Select a cluster with `rfd3-setup-job --cluster NAME`; without it,
@@ -50,9 +50,15 @@ default_cluster: habrok
 clusters:
 
   # ---- RUG / Habrok ------------------------------------------------------
+  # PROVISIONAL — nothing here has been measured on Habrok. max_length values
+  # are extrapolated from the Snellius VRAM curve (L100=3.4GB, L200=8.0GB,
+  # L400=26GB, L600=57GB) against each card's VRAM, leaving headroom because
+  # RFD3 OOMs abruptly rather than degrading. Re-measure, then edit.
+  # NOTE: rc-foundry requires Python >=3.12,<3.13 — the 3.11.5 Boltz module
+  # cannot resolve it. Set the real 3.12 module here once one is identified.
   habrok:
     ssh_target: hpc
-    python_module: Python/3.11.5-GCCcore-13.2.0
+    python_module: PLACEHOLDER-Python-3.12
     venv:
       path: /scratch/{user}/venvs/rfd3
     checkpoint_dir: /scratch/{user}/foundry/checkpoints
@@ -60,9 +66,10 @@ clusters:
     epilog_marker: "Habrok Cluster"
     # Tier chosen by the longest design length in the job (drives VRAM).
     gpu_tiers:
-      - {max_length: 300,     gpu_sbatch: l40s:1,         mem: 32GB}
-      - {max_length: 700,     gpu_sbatch: a100:1,         mem: 48GB}
-      - {max_length: 9999999, gpu_sbatch: rtx_pro_6000:1, mem: 64GB, warn: true}
+      - {max_length: 250,     gpu_sbatch: v100:1,         mem: 32GB}   # 16GB card
+      - {max_length: 400,     gpu_sbatch: l40s:1,         mem: 48GB}   # 48GB card
+      - {max_length: 550,     gpu_sbatch: a100:1,         mem: 64GB}   # 40GB card
+      - {max_length: 9999999, gpu_sbatch: rtx_pro_6000:1, mem: 96GB, warn: true}
     partitions:
       - {name: gpushort,  max_hours: 4,  gpus: [v100:1, a100:1, l40s:1, rtx_pro_6000:1]}
       - {name: gpumedium, max_hours: 24, gpus: [v100:1, a100:1, rtx_pro_6000:1]}
@@ -80,18 +87,30 @@ clusters:
     checkpoint_dir: /projects/<PROJECT>/foundry/checkpoints
     jobs_dir: /projects/<PROJECT>/rfd3_jobs
     epilog_marker: ""
+    # MEASURED peak VRAM: L100=3.4GB  L200=8.0GB  L400=26GB  L600=57GB.
+    # max_length is a hard OOM cliff, not a soft limit. `mem` is HOST RAM.
     gpu_tiers:
-      - {max_length: 700,     gpu_sbatch: a100:1, mem: 48GB}
-      - {max_length: 9999999, gpu_sbatch: h100:1, mem: 64GB}
+      - {max_length: 200, gpu_sbatch: a100_3g.20gb:1, mem: 48GB}   # MIG, cheapest
+      - {max_length: 400, gpu_sbatch: a100:1,         mem: 64GB}   # OOMs at 600
+      - {max_length: 700, gpu_sbatch: h100:1,         mem: 96GB}   # 600 fits at 57GB
+    # cpus_per_gpu is a QOS ceiling: exceed it and sbatch rejects the job.
+    # Nodes are charged per GPU, so the full allowance is taken by default.
     partitions:
-      - {name: gpu_a100, max_hours: 120, gpus: [a100:1]}
-      - {name: gpu_h100, max_hours: 120, gpus: [h100:1]}
+      - {name: gpu_mig,  max_hours: 120, gpus: [a100_3g.20gb:1], cpus_per_gpu: 9}
+      - {name: gpu_a100, max_hours: 120, gpus: [a100:1],         cpus_per_gpu: 18}
+      - {name: gpu_h100, max_hours: 120, gpus: [h100:1],         cpus_per_gpu: 16}
 
-# Walltime model (PROVISIONAL -- recalibrate from real cluster timings).
-# Estimated seconds = designs * (length/100) * (timesteps/100) * sec_per_unit,
-# then scaled by `safety_factor` and rounded up.
+# Walltime model, fitted to measured A100 runs at 200 timesteps:
+#   seconds = (load + n_batches * n_specs * (L/100) *
+#              (sec_per_batch_per_100aa + sec_per_design_per_100aa * batch))
+#             * (timesteps/ref_timesteps) * safety_factor
+# The per-batch term dominates the per-design term -- that is the measured
+# result that raising diffusion_batch_size is nearly free.
 timing:
-  sec_per_unit: 25
+  load_seconds: 30
+  sec_per_batch_per_100aa: 12
+  sec_per_design_per_100aa: 2.2
+  ref_timesteps: 200
   safety_factor: 2.0
   min_minutes: 20
 """
@@ -118,7 +137,16 @@ class Cluster:
 
 @dataclass
 class Timing:
-    sec_per_unit: float = 25.0
+    """Wall-time cost model (see generate.estimate_seconds).
+
+    Defaults are fitted to measured A100 runs at 200 timesteps: the per-batch
+    term dominates the per-design term, which is why batching is nearly free.
+    """
+
+    load_seconds: float = 30.0
+    sec_per_batch_per_100aa: float = 12.0
+    sec_per_design_per_100aa: float = 2.2
+    ref_timesteps: int = 200
     safety_factor: float = 2.0
     min_minutes: int = 20
 
@@ -227,7 +255,10 @@ def load(cluster_name: Optional[str] = None, path: Path = CONFIG_PATH):
 
     t = data.get("timing") or {}
     timing = Timing(
-        sec_per_unit=float(t.get("sec_per_unit", 25)),
+        load_seconds=float(t.get("load_seconds", 30)),
+        sec_per_batch_per_100aa=float(t.get("sec_per_batch_per_100aa", 12)),
+        sec_per_design_per_100aa=float(t.get("sec_per_design_per_100aa", 2.2)),
+        ref_timesteps=int(t.get("ref_timesteps", 200)),
         safety_factor=float(t.get("safety_factor", 2.0)),
         min_minutes=int(t.get("min_minutes", 20)),
     )

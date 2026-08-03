@@ -114,7 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--time", dest="walltime", default=None, help="Override walltime, HH:MM:SS.")
     c.add_argument("--gpu", default=None, help="Override GPU spec, e.g. a100:1.")
     c.add_argument("--mem", default=None, help="Override memory, e.g. 48GB.")
-    c.add_argument("--cpus", type=int, default=8)
+    c.add_argument("--cpus", type=int, default=None,
+                   help="Cores to request (default: the partition's full QOS "
+                        "per-GPU allowance, since nodes are charged per GPU).")
 
     o = ap.add_argument_group("output")
     o.add_argument("--name", default=None, help="Job name (default: out-dir basename).")
@@ -242,23 +244,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         gpu_sbatch = args.gpu or gpu_sbatch
         mem = args.mem or mem
 
+    over_tier = run_rfd3 and generate.exceeds_largest_tier(clu, max_length)
+
     if args.walltime:
         walltime = args.walltime
         seconds = 0
     else:
         seconds = generate.estimate_seconds(
-            designs=total_designs if run_rfd3 else 1,
             length=max_length,
+            batch_size=batch_size if run_rfd3 else 1,
+            n_batches=n_batches if run_rfd3 else 1,
+            n_specs=len(specs) if run_rfd3 else 1,
             timesteps=args.timesteps if run_rfd3 else 0,
             timing=timing,
         )
         walltime = generate.format_walltime(seconds)
 
     try:
-        partition = args.partition or generate.recommend_partition(clu, gpu_sbatch, seconds)
+        if args.partition:
+            partition_name = args.partition
+            partition = generate.partition_by_name(clu, partition_name)
+        else:
+            partition = generate.find_partition(clu, gpu_sbatch, seconds)
+            partition_name = str(partition["name"])
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    cpus = generate.cap_cpus(partition, args.cpus)
 
     # ---- MPNN input location ---------------------------------------------
     if args.mpnn_only:
@@ -327,10 +340,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     slurm = generate.SlurmParams(
         job_name=name,
         time=walltime,
-        partition=partition,
+        partition=partition_name,
         gpus_per_node=gpu_sbatch,
         mem=mem,
-        cpus_per_task=args.cpus,
+        cpus_per_task=cpus,
     )
 
     try:
@@ -356,9 +369,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if run_mpnn:
         print(f"mpnn      : {args.mpnn_model}, {mpnn_batch * mpnn_nbatches} seq/backbone "
               f"from {mpnn_structures}")
-    print(f"resources : {partition}, {gpu_sbatch}, {mem}, walltime {walltime}")
+    print(f"resources : {partition_name}, {gpu_sbatch}, {mem}, {cpus} cpus, "
+          f"walltime {walltime}")
     if warn:
         print("            (largest GPU tier selected -- consider splitting the job)")
+    if over_tier:
+        print(f"WARNING   : design length {max_length} exceeds every configured GPU "
+              f"tier on {clu.name}.")
+        print("            RFD3 memory grows ~L^2 and OOMs abruptly (no graceful "
+              "degradation),")
+        print("            so this will likely die in seconds. Shorten the design or "
+              "add a bigger tier.")
     print(f"written   : {out_dir}/")
     print()
     submit = f"hpcjob submit {job_path} --cluster {clu.name}"
