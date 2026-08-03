@@ -133,6 +133,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--time", dest="walltime", default=None, help="Override walltime, HH:MM:SS.")
     c.add_argument("--gpu", default=None, help="Override GPU spec, e.g. a100:1.")
     c.add_argument("--mem", default=None, help="Override memory, e.g. 48GB.")
+    c.add_argument("--auto-route", action="store_true",
+                   help="Check live GPU availability (via `hpcjob preflight`) and "
+                        "move UP a tier if the size-chosen GPU is fully busy. Never "
+                        "moves down: the tier cap is a hard OOM cliff.")
     c.add_argument("--cpus", type=int, default=None,
                    help="Cores to request (default: the partition's full QOS "
                         "per-GPU allowance, since nodes are charged per GPU).")
@@ -161,6 +165,30 @@ def _copy_package(dest: Path) -> None:
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(src, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+
+def _preflight(cluster_name: str) -> Dict[str, Any]:
+    """Ask `hpcjob preflight` what is free right now.
+
+    hpcjob owns the cluster registry and the ssh layer, so querying it is one
+    subprocess rather than a second implementation here. Any failure returns {}
+    and the caller falls back to the size-based choice.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["hpcjob", "preflight", "--cluster", cluster_name, "--json"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if not proc.stdout.strip():
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return {}
 
 
 def _split_batches(num_designs: int, batch_size: int) -> tuple[int, int]:
@@ -267,6 +295,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         mem = args.mem or mem
 
     over_tier = run_rfd3 and generate.exceeds_largest_tier(clu, max_length)
+
+    # Live queue state, if asked for. Never fatal: a job that cannot be routed
+    # optimally is still a job worth generating.
+    preflight_report: Dict[str, Any] = {}
+    route_note: Optional[str] = None
+    if args.auto_route:
+        preflight_report = _preflight(clu.name)
+        if preflight_report.get("reachable"):
+            gpu_sbatch, new_mem, route_note = generate.reroute_for_availability(
+                clu, gpu_sbatch, preflight_report)
+            if new_mem and not args.mem:
+                mem = new_mem
+        elif preflight_report:
+            route_note = (f"{clu.name} is not reachable -- "
+                          f"{preflight_report.get('ssh_error', 'unknown error')}")
+        else:
+            route_note = "could not run `hpcjob preflight` (is hpcjob installed?)"
 
     # Smallest partial_t across specs -- the least discount, so the estimate
     # stays conservative when a job mixes partial and full diffusion.
@@ -459,6 +504,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"from {mpnn_structures}")
     print(f"resources : {partition_name}, {gpu_sbatch}, {mem}, {cpus} cpus, "
           f"walltime {walltime}")
+    if route_note:
+        print(f"routing   : {route_note}")
     if warn:
         print("            (largest GPU tier selected -- consider splitting the job)")
     if over_tier:

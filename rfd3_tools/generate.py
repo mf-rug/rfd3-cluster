@@ -105,6 +105,47 @@ def recommend_gpu(cluster, max_length: int) -> Tuple[str, str, bool]:
     )
 
 
+def reroute_for_availability(cluster, gpu_sbatch: str, report: Dict[str, Any]):
+    """Move up a GPU tier when the size-chosen one is fully busy.
+
+    `gpu_tiers` is ordered by capability (ascending `max_length`), which is the
+    ordering Slurm does not expose -- it reports GPU *names*, not their VRAM.
+    That is why this decision lives here and not in `hpcjob preflight`, which
+    can only report what is free.
+
+    Only ever moves **up**. A tier's `max_length` is a hard OOM cliff, so a
+    smaller card is never a valid substitute however idle it looks; the worst
+    case for moving up is spending a larger GPU than strictly needed.
+
+    Returns (gpu_sbatch, mem, reason) -- unchanged input and None if no move.
+    """
+    totals = (report or {}).get("gpu_totals") or {}
+    if not totals:
+        return gpu_sbatch, None, None
+
+    def free_of(spec: str) -> Optional[int]:
+        entry = totals.get(str(spec).split(":")[0].lower())
+        return None if entry is None else int(entry.get("free", 0))
+
+    current_free = free_of(gpu_sbatch)
+    if current_free is None or current_free > 0:
+        return gpu_sbatch, None, None
+
+    names = [str(t.get("gpu_sbatch", "")) for t in cluster.gpu_tiers]
+    try:
+        idx = names.index(gpu_sbatch)
+    except ValueError:
+        return gpu_sbatch, None, None
+
+    for tier in cluster.gpu_tiers[idx + 1:]:
+        spec = str(tier.get("gpu_sbatch", ""))
+        free = free_of(spec)
+        if free and free > 0:
+            return (spec, str(tier.get("mem", "")),
+                    f"all {gpu_sbatch} busy; {free} x {spec} free (moved up a tier)")
+    return gpu_sbatch, None, f"all {gpu_sbatch} busy and no larger tier is free"
+
+
 def exceeds_largest_tier(cluster, max_length: int) -> bool:
     """True when no configured tier covers this design length."""
     if not cluster.gpu_tiers:
