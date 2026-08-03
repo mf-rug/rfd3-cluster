@@ -87,11 +87,14 @@ clusters:
     checkpoint_dir: /projects/<PROJECT>/foundry/checkpoints
     jobs_dir: /projects/<PROJECT>/rfd3_jobs
     epilog_marker: ""
-    # MEASURED peak VRAM: L100=3.4GB  L200=8.0GB  L400=26GB  L600=57GB.
-    # max_length is a hard OOM cliff, not a soft limit. `mem` is HOST RAM.
+    # MEASURED peak VRAM: L100=3.4  L200=8.0  L400=26  L460=32.7  L480=35.5
+    # L500=38.4 (97% of a 40GB A100)  L520=OOM  L600=57 (on H100).
+    # max_length is a hard OOM cliff, not a soft limit, and is set BELOW the
+    # measured cliff: memory follows token count, and a ligand or extra chain
+    # makes a design wider than its stated length. `mem` is HOST RAM.
     gpu_tiers:
       - {max_length: 200, gpu_sbatch: a100_3g.20gb:1, mem: 48GB}   # MIG, cheapest
-      - {max_length: 400, gpu_sbatch: a100:1,         mem: 64GB}   # OOMs at 600
+      - {max_length: 460, gpu_sbatch: a100:1,         mem: 64GB}   # 500 fits, 520 OOMs
       - {max_length: 700, gpu_sbatch: h100:1,         mem: 96GB}   # 600 fits at 57GB
     # cpus_per_gpu is a QOS ceiling: exceed it and sbatch rejects the job.
     # Nodes are charged per GPU, so the full allowance is taken by default.
