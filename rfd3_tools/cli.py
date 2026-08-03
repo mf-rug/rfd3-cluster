@@ -235,7 +235,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ---- resources --------------------------------------------------------
     batch_size, n_batches = _split_batches(args.num_designs, args.batch_size)
     total_designs = batch_size * n_batches * max(1, len(specs) or 1)
-    max_length = spec_mod.max_design_length(specs) if specs else 200
+    if specs:
+        max_length, length_origin = spec_mod.design_length(specs, sources)
+    else:
+        max_length, length_origin = 200, "default"
 
     if args.gpu and args.mem:
         gpu_sbatch, mem, warn = args.gpu, args.mem, False
@@ -366,6 +369,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"designs   : {batch_size} x {n_batches} = {batch_size * n_batches} per spec"
               f"  ({total_designs} total)")
         print(f"timesteps : {args.timesteps}")
+        print(f"length    : {max_length} residues ({length_origin})")
     if run_mpnn:
         print(f"mpnn      : {args.mpnn_model}, {mpnn_batch * mpnn_nbatches} seq/backbone "
               f"from {mpnn_structures}")

@@ -97,10 +97,13 @@ from an exit trap).
 
 ## Known provisional bits
 
-- `spec.max_design_length()` assumes 300 residues when length is implied by a
-  contig rather than stated, since resolving a contig needs the structure.
-  With a hard OOM cliff that assumption is load-bearing — a long contig-implied
-  design can silently pick too small a GPU.
+- `spec.design_length()` resolves length in order of reliability: explicit
+  `length` → contig arithmetic → CA count of the input structure → an assumed
+  300. The assumption is now the last resort rather than the first, and the CLI
+  prints which one applied (`length : 441 residues (counted from x.pdb)`), so a
+  wrong tier is visible before submission rather than after an OOM. Remaining
+  gap: a contig with a segment this parser can't read falls through to the
+  structure count, which is the *input* length, not the designed length.
 - **Untested end-to-end: no job has run on a cluster yet.** The generator,
   validator, MPNN-config builder and log parser have local coverage only; the
   Snellius install itself is verified.

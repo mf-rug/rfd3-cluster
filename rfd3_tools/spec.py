@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # Mirrors DesignInputSpecification's fields (minus `atom_array_input`, which is
 # an in-memory object and cannot appear in JSON).  Keep in sync with the
@@ -152,23 +152,163 @@ def validate_spec(name: str, spec: Dict[str, Any]) -> None:
             raise SpecError(f"spec {name!r}: 'partial_t' must be >= 0.")
 
 
-def max_design_length(specs: Dict[str, Dict[str, Any]]) -> int:
-    """Largest design length across specs -- drives the GPU tier.
+ASSUMED_LENGTH = 300  # last resort when nothing else resolves
 
-    Falls back to a conservative default when length is implied by a contig
-    rather than stated, since we can't resolve a contig without the structure.
+
+def _contig_length(contig: str) -> Optional[int]:
+    """Residue count a contig string resolves to, or None if unparseable.
+
+    Segments are summed, taking the longest option of a variable-length one:
+    ``A1-100`` (motif from the input, 100 res) + ``50-150`` (de novo, up to
+    150) = 250.  A chain-qualified segment is a residue *range*, so its length
+    is ``end - start + 1``; a bare numeric one is a length in its own right.
     """
-    best = 0
+    total = 0
+    for token in re.split(r"[,/]", contig):
+        token = token.strip()
+        if not token:
+            continue
+        chain_range = re.fullmatch(r"[A-Za-z]+(-?\d+)-(-?\d+)", token)
+        if chain_range:
+            start, end = int(chain_range.group(1)), int(chain_range.group(2))
+            total += abs(end - start) + 1
+            continue
+        if re.fullmatch(r"[A-Za-z]+-?\d+", token):
+            total += 1                       # single named residue
+            continue
+        numeric_range = re.fullmatch(r"(\d+)-(\d+)", token)
+        if numeric_range:
+            total += int(numeric_range.group(2))
+            continue
+        if token.isdigit():
+            total += int(token)
+            continue
+        return None                          # unrecognised -- don't guess
+    return total or None
+
+
+def _pdb_residue_count(text: str) -> int:
+    count = 0
+    for line in text.splitlines():
+        if line.startswith("ENDMDL"):
+            break
+        if line.startswith("ATOM") and line[12:16].strip() == "CA":
+            count += 1
+    return count
+
+
+def _cif_residue_count(text: str) -> int:
+    """Count CA atoms of the first model in an mmCIF `_atom_site` loop."""
+    columns: List[str] = []
+    count = 0
+    in_loop = False
+    first_model: Optional[str] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("_atom_site."):
+            columns.append(stripped.split(".", 1)[1].split()[0])
+            in_loop = True
+            continue
+        if not in_loop:
+            continue
+        if not stripped or stripped.startswith(("#", "loop_", "_", "data_")):
+            if columns:
+                break                        # loop ended
+            continue
+        fields = stripped.split()
+        if len(fields) != len(columns):
+            continue
+        row = dict(zip(columns, fields))
+        if row.get("group_PDB", "ATOM") != "ATOM":
+            continue
+        atom = row.get("label_atom_id") or row.get("auth_atom_id") or ""
+        if atom.strip('"\'') != "CA":
+            continue
+        model = row.get("pdbx_PDB_model_num")
+        if model is not None:
+            if first_model is None:
+                first_model = model
+            elif model != first_model:
+                continue
+        count += 1
+    return count
+
+
+def structure_residue_count(path: Path) -> Optional[int]:
+    """Polymer residue count of a local PDB/mmCIF, or None if unreadable.
+
+    Counts CA atoms, so it reports the *modelled* length -- which is what RFD3
+    allocates for, and is what a partial-diffusion design ends up being.
+    """
+    try:
+        name = path.name.lower()
+        if name.endswith(".gz"):
+            import gzip
+            with gzip.open(path, "rt", errors="replace") as handle:
+                text = handle.read()
+            name = name[: -len(".gz")]
+        else:
+            text = path.read_text(errors="replace")
+        count = (_cif_residue_count(text) if name.endswith(".cif")
+                 else _pdb_residue_count(text))
+        return count or None
+    except (OSError, ValueError):
+        return None
+
+
+def design_length(
+    specs: Dict[str, Dict[str, Any]],
+    sources: Iterable[str] = (),
+) -> Tuple[int, str]:
+    """Largest design length across specs, plus how it was determined.
+
+    Length drives the GPU tier, and `max_length` is a hard OOM cliff rather
+    than a soft limit, so guessing low is expensive.  Resolved in order of
+    reliability: an explicit `length`, else the contig's arithmetic, else the
+    residue count of the input structure (the partial-diffusion case, where
+    length is implicit in the file and used to be assumed at 300).
+
+    `sources` are the pre-rewrite local paths from `rewrite_input_paths`; by
+    the time the CLI computes resources, each spec's `input` already points at
+    the not-yet-populated `./input/structures/` copy, so the originals are
+    matched back by basename.
+    """
+    by_name = {Path(source).name: Path(source).expanduser() for source in sources}
+    best, origin = 0, ""
+
+    def better(length: int, why: str) -> None:
+        nonlocal best, origin
+        if length > best:
+            best, origin = length, why
+
     for spec in specs.values():
         length = spec.get("length")
-        if length is None:
-            best = max(best, 300)  # unknown: assume mid-size
-            continue
-        text = str(length)
-        nums = [int(n) for n in re.findall(r"\d+", text)]
-        if nums:
-            best = max(best, max(nums))
-    return best or 100
+        if length is not None:
+            nums = [int(n) for n in re.findall(r"\d+", str(length))]
+            if nums:
+                better(max(nums), "from length")
+                continue
+
+        contig = spec.get("contig")
+        if isinstance(contig, str) and contig:
+            resolved = _contig_length(contig)
+            if resolved:
+                better(resolved, "from contig")
+                continue
+
+        source = spec.get("input")
+        if isinstance(source, str) and source:
+            path = by_name.get(Path(source).name, Path(source).expanduser())
+            counted = structure_residue_count(path)
+            if counted:
+                better(counted, f"counted from {path.name}")
+                continue
+
+        better(ASSUMED_LENGTH, "assumed -- not stated and no readable input")
+
+    if not best:
+        return 100, "default"
+    return best, origin
 
 
 # ---------------------------------------------------------------------------
