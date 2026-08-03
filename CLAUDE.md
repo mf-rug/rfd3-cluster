@@ -60,7 +60,10 @@ from an exit trap).
   latter being `{globals…, "inputs": [ {structure_path, name, …}, … ]}`. The
   batch form is what the job uses: one process, model loaded once.
   `is_legacy_weights: true` is required for every checkpoint in the default
-  registry.
+  registry. **MPNN has no design scope by default and redesigns every residue**
+  ("Design scope - if all None, design all residues"); per-input
+  `designed_residues` / `fixed_residues` take `["A801", …]` and are mutually
+  exclusive. The generator derives the scope from `select_unfixed_sequence`.
 - **Checkpoints** are found via `~/.foundry/checkpoints` **plus**
   `$FOUNDRY_CHECKPOINT_DIRS` (colon-separated). Since weights live on
   scratch/project, every job exports the latter.
@@ -76,9 +79,12 @@ from an exit trap).
 - Models are invoked as `python -c "from rfd3.cli import app; app()"` (and the
   MPNN equivalent) so a stray binary earlier on `PATH` can't shadow the venv's
   interpreter — same reasoning as the boltz job scripts.
-- Transport is **not** this repo's job: `hpcjob` handles submit/pull. The only
-  change made there was a `--jobs-dir` flag on `submit`, so RFD3 jobs land in
-  `rfd3_jobs/` without needing duplicate cluster entries.
+- Transport is **not** this repo's job: `hpcjob` handles submit/pull. A
+  `--jobs-dir` flag was added there so RFD3 jobs land in `rfd3_jobs/` without
+  duplicate cluster entries — **but that change was never pushed**, and the
+  published `hpcjob` (0.1.0) rejects the flag, so the submit line this tool
+  prints fails for anyone starting from a clean install. Works without it: the
+  registry entry's own `jobs_dir` routes correctly. See HANDOFF_FIRST_RUN.md 3.4.
 
 ## State of calibration
 
@@ -104,9 +110,11 @@ from an exit trap).
   wrong tier is visible before submission rather than after an OOM. Remaining
   gap: a contig with a segment this parser can't read falls through to the
   structure count, which is the *input* length, not the designed length.
-- **Untested end-to-end: no job has run on a cluster yet.** The generator,
-  validator, MPNN-config builder and log parser have local coverage only; the
-  Snellius install itself is verified.
+- **First end-to-end cluster run done 2026-08-03** (Snellius, jobs 25172015 /
+  25172019: 2 specs x 8 designs, 440 res, partial diffusion + LigandMPNN, ~6.5
+  min each). Three problems found; all fixed. Remaining calibration issues and
+  the full report: **`HANDOFF_FIRST_RUN.md`** -- read it before changing tiers,
+  the walltime model or the QC summary.
 - Unverified upstream: whether MPNN reads `.cif.gz` directly (the job stages
   decompressed copies via `--gunzip-to` to sidestep it), and whether MPNN's
   batch-JSON path names outputs like the single-`--structure_path` path.
