@@ -50,26 +50,27 @@ default_cluster: habrok
 clusters:
 
   # ---- RUG / Habrok ------------------------------------------------------
-  # PROVISIONAL — nothing here has been measured on Habrok. max_length values
-  # are extrapolated from the Snellius VRAM curve (L100=3.4GB, L200=8.0GB,
-  # L400=26GB, L600=57GB) against each card's VRAM, leaving headroom because
-  # RFD3 OOMs abruptly rather than degrading. Re-measure, then edit.
-  # NOTE: rc-foundry requires Python >=3.12,<3.13 — the 3.11.5 Boltz module
-  # cannot resolve it. Set the real 3.12 module here once one is identified.
+  # No Foundry install here yet (venv absent as of 2026-08-05); Python
+  # 3.12.3-GCCcore-13.3.0 exists, so the install is unblocked.
   habrok:
     ssh_target: hpc
-    python_module: PLACEHOLDER-Python-3.12
+    python_module: Python/3.12.3-GCCcore-13.3.0
     venv:
       path: /scratch/{user}/venvs/rfd3
     checkpoint_dir: /scratch/{user}/foundry/checkpoints
     jobs_dir: /scratch/{user}/rfd3_jobs
     epilog_marker: "Habrok Cluster"
-    # Tier chosen by the longest design length in the job (drives VRAM).
+    # Tier caps derived from the MEASURED A100 curve on Snellius
+    # (mem ~= 4.04 + 1.372e-4 * L^2 GiB; that fit reproduces the measured
+    # L=460/480 points to within 2%) solved against each card's VRAM at the
+    # same ~82% occupancy the measured a100 cap sits at. VRAM per card from
+    # the Habrok cluster description: v100 32GB, a100 40GB, l40s 48GB,
+    # rtx_pro_6000 96GB. EXTRAPOLATED -- run verify/bisect.sh here to confirm.
     gpu_tiers:
-      - {max_length: 250,     gpu_sbatch: v100:1,         mem: 32GB}   # 16GB card
-      - {max_length: 400,     gpu_sbatch: l40s:1,         mem: 48GB}   # 48GB card
-      - {max_length: 550,     gpu_sbatch: a100:1,         mem: 64GB}   # 40GB card
-      - {max_length: 9999999, gpu_sbatch: rtx_pro_6000:1, mem: 96GB, warn: true}
+      - {max_length: 390, gpu_sbatch: v100:1,         mem: 32GB}   # 32GB card
+      - {max_length: 460, gpu_sbatch: a100:1,         mem: 64GB}   # 40GB, measured
+      - {max_length: 500, gpu_sbatch: l40s:1,         mem: 48GB}   # 48GB card
+      - {max_length: 730, gpu_sbatch: rtx_pro_6000:1, mem: 96GB, warn: true}
     partitions:
       - {name: gpushort,  max_hours: 4,  gpus: [v100:1, a100:1, l40s:1, rtx_pro_6000:1]}
       - {name: gpumedium, max_hours: 24, gpus: [v100:1, a100:1, rtx_pro_6000:1]}

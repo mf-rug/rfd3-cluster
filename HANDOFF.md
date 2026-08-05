@@ -40,16 +40,16 @@ Boltz venvs or caches.
 Every item here is **measured on Snellius**, not guessed. Most are
 cluster-independent and will bite on Hábrók too.
 
-### 1.1 Python must be exactly 3.12.x — biggest risk to this install
+### 1.1 Python must be exactly 3.12.x — RESOLVED for Hábrók
 
 `rc-foundry` 0.2.0 declares `Requires-Python: >=3.12,<3.13`. **3.11 cannot
 resolve it at all, and 3.13 is equally excluded.** Hábrók's Boltz module is
 Python 3.11.5 — **do not reuse it**.
 
-**Do this first, before creating anything:** `module spider Python`. If Hábrók
-offers no 3.12.x, stop and report — that is a genuine blocker, and the
-fallbacks (EESSI stack, a `uv`-managed standalone 3.12, conda/mamba 3.12) are a
-decision for the user, not something to pick unilaterally.
+**Checked 2026-08-05: Hábrók has `Python/3.12.3-GCCcore-13.3.0`** (the only
+3.12 on offer; the others are 3.13.1 and 3.13.5, both excluded). No year-stack
+prefix is needed, unlike Snellius. This was the biggest risk to the install and
+it is cleared — use that module.
 
 ### 1.2 The RFD3 CLI spec-override syntax needs a `+`
 
@@ -113,9 +113,10 @@ dropped.
 `torch==2.10.0+cu128` reports
 `sm_70 sm_75 sm_80 sm_86 sm_90 sm_100 sm_120` — so **V100 (sm_70) is supported
 by the wheel**, and Blackwell too. On Hábrók the real V100 question is
-therefore **memory, not compute**: extrapolating §1.4, a 16 GB V100 caps out
-around **L≈250** and a 32 GB one around **L≈400**. Expect V100 to be *usable
-but length-limited*, not broken.
+therefore **memory, not compute**. Hábrók's V100s are **32 GB** (per the
+cluster description — not 16 GB, which an earlier draft of this file assumed),
+so extrapolating the measured curve they cap out around **L≈390**. Expect V100
+to be *usable but length-limited*, not broken.
 
 ### 1.6 `base-models` is 7.9 GB, not 5.5 GB
 
