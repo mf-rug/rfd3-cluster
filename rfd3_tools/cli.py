@@ -191,6 +191,32 @@ def _preflight(cluster_name: str) -> Dict[str, Any]:
         return {}
 
 
+def _hpcjob_supports_jobs_dir() -> Optional[bool]:
+    """Does the *installed* hpcjob accept --jobs-dir? None if it can't be asked.
+
+    The two tools version independently, so "current here, behind there" is a
+    normal state rather than an error. Printing a command that the installed
+    hpcjob rejects surfaces the mismatch as *"this command is wrong"*, which
+    sends you looking in the wrong place.
+
+    The flag is NOT dropped when unsupported: it is only redundant if the
+    hpcjob registry's `jobs_dir` for the cluster already matches this tool's,
+    and when they differ (the usual case, since RFD3 and boltz keep separate
+    job directories) dropping it would silently file the job under the other
+    tool's directory.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(["hpcjob", "submit", "--help"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return "--jobs-dir" in proc.stdout
+
+
 def _split_batches(num_designs: int, batch_size: int) -> tuple[int, int]:
     """Map a design count onto (diffusion_batch_size, n_batches)."""
     batch_size = max(1, min(batch_size, num_designs))
@@ -518,13 +544,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"written   : {out_dir}/")
     print()
     submit = f"hpcjob submit {job_path} --cluster {clu.name}"
-    if clu.jobs_dir:
+    supports = _hpcjob_supports_jobs_dir() if clu.jobs_dir else True
+    if clu.jobs_dir and supports is not False:
         submit += f" --jobs-dir {clu.jobs_dir}"
     print("submit with:")
     print(f"  {submit}")
     # Resubmits are common after a fast validation failure, and hpcjob prompts
     # when the remote dir exists.
     print(f"  {submit} --overwrite      # if resubmitting into the same dir")
+    if clu.jobs_dir and supports is False:
+        print()
+        print("WARNING   : the installed hpcjob has no --jobs-dir, so the lines above")
+        print("            omit it and the job will land in that cluster's configured")
+        print(f"            jobs_dir, not {clu.jobs_dir}.")
+        print("            Fix: update hpcjob (`git -C <checkout> pull --ff-only`; if")
+        print("            `hpcjob doctor` says 'installed snapshot', reinstall with")
+        print("            `pip install -e <checkout>`), or point its registry entry")
+        print("            for this cluster at the path above.")
     print()
     # `pull` defaults to ./<name>/, which is not the job dir the results belong
     # to; --dest puts output/ next to the inputs that produced it.
