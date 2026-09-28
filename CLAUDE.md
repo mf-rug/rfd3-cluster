@@ -79,24 +79,30 @@ from an exit trap).
 - Models are invoked as `python -c "from rfd3.cli import app; app()"` (and the
   MPNN equivalent) so a stray binary earlier on `PATH` can't shadow the venv's
   interpreter — same reasoning as the boltz job scripts.
-- Transport is **not** this repo's job: `hpcjob` handles submit/pull. A
-  `--jobs-dir` flag was added there so RFD3 jobs land in `rfd3_jobs/` without
-  duplicate cluster entries — **but that change was never pushed**, and the
-  published `hpcjob` (0.1.0) rejects the flag, so the submit line this tool
-  prints fails for anyone starting from a clean install. Works without it: the
-  registry entry's own `jobs_dir` routes correctly. See HANDOFF_FIRST_RUN.md 3.4.
+- Transport is **not** this repo's job: `hpcjob` handles submit/pull. Its
+  `--jobs-dir` flag (pushed as `de49b1e`) lets RFD3 jobs land in `rfd3_jobs/`
+  without duplicate cluster entries. An older installed `hpcjob` rejects it, so
+  the printed submit line probes `hpcjob submit --help` and omits the flag with
+  a warning when unsupported — it is not dropped silently, because the two
+  `jobs_dir` values deliberately differ and dropping it would file RFD3 jobs
+  under the boltz directory.
 
 ## State of calibration
 
 - **Snellius: measured.** `gpu_tiers` and the `timing` constants come from the
-  install report of 2026-08-03 (length × batch grid on A100 / H100 / A100-MIG).
-  Caveats stated there: the MIG `max_length: 200` and the H100 `max_length: 700`
-  are *inferred*, not measured at the boundary; the A100 `400` is measured on
-  both sides. Bisect before trusting the inferred ones.
-- **Hábrók: provisional.** Nothing measured. Tiers are extrapolated from the
-  Snellius VRAM curve against each card's VRAM, and `python_module` is a
-  deliberate `PLACEHOLDER-Python-3.12` — `rc-foundry` needs `>=3.12,<3.13`, so
-  the 3.11.5 Boltz module cannot be reused. Fix both after that install.
+  install report of 2026-08-03 (length × batch grid on A100 / H100 / A100-MIG),
+  plus a boundary bisect on 2026-08-05: L=500 fits at 38.35 GiB (97% of a 40 GB
+  A100), L=520 OOMs, so the a100 tier is **460** with headroom for token count
+  exceeding stated length. Batch independence holds at the boundary (batch 1/4/8
+  within 2.3 MB). The MIG `max_length: 200` and H100 `max_length: 700` are still
+  *inferred* — `verify/bisect.sh` settles them.
+- **Hábrók: no install yet, tiers extrapolated.** `python_module` is now the
+  real `Python/3.12.3-GCCcore-13.3.0` (confirmed present 2026-08-05; it is the
+  only 3.12 there, and `rc-foundry` needs `>=3.12,<3.13`, so the 3.11.5 Boltz
+  module cannot be reused). Tier caps are solved from the measured Snellius
+  curve against each card's real VRAM — note **V100 is 32 GB, not 16** — giving
+  v100 390 / a100 460 / l40s 500 / rtx_pro_6000 730. No Foundry venv exists
+  there yet; run `verify/bisect.sh` once it does.
 - The walltime model is fitted to A100 at 200 timesteps and has a `safety_factor`
   of 2. H100 is ~1.4–1.6× faster; no per-tier speed factor is applied yet
   (`estimate_seconds` accepts `gpu_speedup` but the CLI never passes it).
@@ -113,9 +119,8 @@ from an exit trap).
   `--time` for large re-sequencing runs.
 - **A100 evidence beyond the grid**: 442 tokens (440 res + NAD, 2 chains,
   3436 atoms) ran on an A100-**40 GB** without OOM. That is a pass/fail
-  observation — no peak-VRAM number was captured — but it means the real cliff
-  is above the configured `max_length: 400`, not at it. The boundary between
-  442 and 600 remains unmeasured.
+  observation — no peak-VRAM number was captured — and the boundary has since
+  been measured directly: the cliff sits between 500 and 520 (see above).
 
 ## Known provisional bits
 
@@ -134,3 +139,10 @@ from an exit trap).
 - Unverified upstream: whether MPNN reads `.cif.gz` directly (the job stages
   decompressed copies via `--gunzip-to` to sidestep it), and whether MPNN's
   batch-JSON path names outputs like the single-`--structure_path` path.
+
+## Building another tool like this
+
+The pattern this repo and `boltz-setup` share — what `hpcjob` owns, when a
+dedicated generator is worth it, the config rule, and the trap catalogue — is
+written up in `hpcjob/docs/NEW-CLUSTER-TOOL.md`. Read it before starting a
+third toolbox, and add to it when something new bites.
