@@ -73,6 +73,14 @@ from an exit trap).
   scratch/project, every job exports the latter.
 - MPNN checkpoint filenames carry version numbers (`proteinmpnn_v_48_020.pt`),
   so the job resolves them by **glob at run time** rather than a hardcoded name.
+- **Checkpoint provenance is recorded, not pinned.** RFD3's own sidecar JSON
+  carries `ckpt_path`, and it is the *resolved* path — `/gpfs/...`, not the
+  `/projects/...` symlink the config points at — so anything joining on it must
+  use realpath or basename. A `checkpoint_manifest.json` schema (sha256 of the
+  checkpoints a job actually touched; ~4 s, no caching needed) is **agreed with
+  the macOS session but unimplemented on both sides**; spec lives at
+  `docs/checkpoint-manifest-schema.md` in the rfd3-design repo. Build it only
+  when a real reproducibility question arrives, and match that doc exactly.
 
 ## Conventions that matter
 
