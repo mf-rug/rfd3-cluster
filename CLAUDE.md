@@ -54,8 +54,12 @@ from an exit trap).
   nearly free, and `max_length` is a hard OOM cliff — RFD3 dies on one big
   allocation in the pairwise embedding rather than degrading.
 - **Invoke by absolute `<venv>/bin/…` path.** Immune to `PATH` ordering and to a
-  missing `module load`, and it avoids `rfd3/cli.py` stripping literal
-  `design`/`fold` tokens from the argument list (the `python -c` form's trap).
+  missing `module load`. (An earlier note here claimed it also dodged
+  `rfd3/cli.py` stripping literal `design`/`fold` tokens — it does not: that
+  filter is at `rfd3/cli.py:28`, inside the typer command, so every dispatch
+  path inherits it. It drops tokens *exactly equal to* those words, and Hydra
+  overrides are single `key=value` tokens, so `key=design` survives; only a
+  bare standalone argument would be eaten.)
 - **MPNN CLI** takes either one `--structure_path` or `--config_json`, the
   latter being `{globals…, "inputs": [ {structure_path, name, …}, … ]}`. The
   batch form is what the job uses: one process, model loaded once.
@@ -76,9 +80,10 @@ from an exit trap).
   comes from the selected cluster's config block. That is what makes
   `--cluster snellius` produce a correct script with no hand-editing.
 - Job scripts use `$SLURM_SUBMIT_DIR`, never a path baked in at generation time.
-- Models are invoked as `python -c "from rfd3.cli import app; app()"` (and the
-  MPNN equivalent) so a stray binary earlier on `PATH` can't shadow the venv's
-  interpreter — same reasoning as the boltz job scripts.
+- Models are invoked by **absolute venv path** (`<venv>/bin/rfd3`,
+  `<venv>/bin/mpnn`) so a stray binary earlier on `PATH` can't shadow them and
+  no `module load` is required. The boltz scripts use the `python -c` form for
+  the same end; either works, and neither affects the argv strip above.
 - Transport is **not** this repo's job: `hpcjob` handles submit/pull. Its
   `--jobs-dir` flag (pushed as `de49b1e`) lets RFD3 jobs land in `rfd3_jobs/`
   without duplicate cluster entries. An older installed `hpcjob` rejects it, so
